@@ -1,5 +1,8 @@
 # Apiary Ears
 
+<img src="docs/img/apiary-ears-avatar.png" width="120" align="right" alt="">
+
+
 **Listening to a colony and smelling it at the same time, to find out whether a swarm
 announces itself before it goes.**
 
