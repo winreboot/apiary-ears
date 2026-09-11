@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 620" width="720" height="620" role="img">
+<title>Apiary Ears wiring: INMP441 and BME688 on an ESP32-S3</title>
+<rect width="720" height="620" fill="#14110c"/>
+<style>.t{fill:#e9dcc3;font:13px system-ui}.s{fill:#9a8a6a;font:11px system-ui}.h{fill:#e8b923;font:600 13px system-ui}.b{fill:none;stroke:#4a4136}</style>
+<text class="h" x="360" y="28" text-anchor="middle">Apiary Ears &#8212; INMP441 microphone + BME688 on an ESP32-S3</text>
+<rect class="b" x="470" y="52" width="210" height="420" rx="8"/>
+<text class="h" x="575" y="76" text-anchor="middle">ESP32-S3 devkit</text>
+<text class="t" x="484" y="108">3V3</text><text class="t" x="484" y="138">GND</text>
+<text class="h" x="484" y="180">GPIO4</text><text class="s" x="552" y="180">mic SD</text>
+<text class="h" x="484" y="210">GPIO5</text><text class="s" x="552" y="210">mic WS</text>
+<text class="h" x="484" y="240">GPIO6</text><text class="s" x="552" y="240">mic SCK</text>
+<text class="t" x="484" y="270">GND</text><text class="s" x="552" y="270">mic L/R + GND</text>
+<text class="t" x="484" y="300">3V3</text><text class="s" x="552" y="300">mic VDD</text>
+<text class="h" x="484" y="354">GPIO21</text><text class="s" x="552" y="354">SDA</text>
+<text class="h" x="484" y="384">GPIO13</text><text class="s" x="552" y="384">SCL</text>
+<rect class="b" x="40" y="140" width="190" height="180" rx="8"/>
+<text class="h" x="135" y="164" text-anchor="middle">INMP441 mic</text>
+<text class="t" x="218" y="190" text-anchor="end">SD</text><text class="t" x="218" y="216" text-anchor="end">WS</text>
+<text class="t" x="218" y="242" text-anchor="end">SCK</text><text class="t" x="218" y="268" text-anchor="end">L/R</text>
+<text class="t" x="218" y="292" text-anchor="end">GND</text><text class="t" x="218" y="314" text-anchor="end">VDD</text>
+<path d="M226 186 L456 186 L464 176 L468 176" stroke="#F2A623" stroke-width="2.5" fill="none"/>
+<path d="M226 212 L452 212 L460 206 L468 206" stroke="#E06AA3" stroke-width="2.5" fill="none"/>
+<path d="M226 238 L452 238 L460 236 L468 236" stroke="#B07FE8" stroke-width="2.5" fill="none"/>
+<path d="M226 264 L456 264 L462 266 L468 266" stroke="#888780" stroke-width="2.5" fill="none"/>
+<path d="M226 288 L450 288 L458 268 L468 268" stroke="#888780" stroke-width="2.5" fill="none"/>
+<path d="M226 310 L446 310 L456 296 L468 296" stroke="#D85A30" stroke-width="2.5" fill="none"/>
+<text class="s" x="40" y="342">L/R to GND selects the left channel &#8212; the firmware reads left only.</text>
+<rect class="b" x="40" y="372" width="190" height="118" rx="8"/>
+<text class="h" x="135" y="396" text-anchor="middle">BME688 &#183; smell / T / RH</text>
+<text class="t" x="218" y="420" text-anchor="end">VDD</text><text class="t" x="218" y="444" text-anchor="end">GND</text>
+<text class="t" x="218" y="464" text-anchor="end">SCL</text><text class="t" x="218" y="486" text-anchor="end">SDA / MOSI</text>
+<path d="M226 416 L440 416 L440 104 L468 104" stroke="#D85A30" stroke-width="2.5" fill="none"/>
+<path d="M226 440 L434 440 L434 134 L468 134" stroke="#888780" stroke-width="2.5" fill="none"/>
+<path d="M226 464 L460 464 L466 464 L466 380 L468 380" stroke="#7A9BFF" stroke-width="2.5" fill="none"/>
+<path d="M226 486 L464 486 L470 486 L470 350 L468 350" stroke="#1D9E75" stroke-width="2.5" fill="none"/>
+
+
+
+
+<text class="s" x="274" y="430">MISO and CS stay empty &#8212; they are for SPI</text>
+<rect class="b" x="40" y="510" width="640" height="76" rx="8" stroke-dasharray="5 4"/>
+<text class="h" x="360" y="534" text-anchor="middle">2.2 k&#937; from SDA to 3V3 and from SCL to 3V3, at the SENSOR end</text>
+<text class="s" x="360" y="556" text-anchor="middle">The microphone needs no pull-ups. Do not touch the metal cap on the BME688.</text>
+<text class="s" x="360" y="576" text-anchor="middle">Point the mic through a small hole in the hive wall; keep the board outside in a vented box.</text>
+</svg>

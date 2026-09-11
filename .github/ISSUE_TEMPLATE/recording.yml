@@ -1,0 +1,47 @@
+name: Share a recording
+description: Contribute an acoustic session without using git
+title: "[session] "
+labels: ["submission"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Drag your exported JSON into the last box. A maintainer will validate and file it.
+  - type: input
+    id: apiary
+    attributes:
+      label: Apiary id
+      description: Short, lower-case, stable. e.g. hive-observatory-pa
+    validations:
+      required: true
+  - type: input
+    id: what
+    attributes:
+      label: What happened during this recording?
+      description: e.g. "routine week, nothing unusual", "swarm issued on the 12th at about 11am"
+    validations:
+      required: true
+  - type: dropdown
+    id: swarm
+    attributes:
+      label: Did this colony swarm within a week of this recording?
+      options:
+        - "no"
+        - "yes"
+        - "not sure"
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Your setup
+      description: Mic type and where it sits, whether a BME688 is fitted and how long it has been running, hive type, climate, anything unusual.
+    validations:
+      required: true
+  - type: textarea
+    id: file
+    attributes:
+      label: Session file
+      description: Drag the .json here.
+    validations:
+      required: true

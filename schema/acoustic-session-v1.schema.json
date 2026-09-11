@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Apiary Ears acoustic session",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "kind",
+    "node",
+    "label",
+    "bands_hz",
+    "minutes"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "acoustic"
+    },
+    "node": {
+      "type": "string",
+      "maxLength": 60
+    },
+    "firmware": {
+      "type": "string",
+      "maxLength": 80
+    },
+    "label": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 60
+    },
+    "notes": {
+      "type": "string",
+      "maxLength": 2000
+    },
+    "bands_hz": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 32,
+      "items": {
+        "type": "number",
+        "minimum": 10,
+        "maximum": 8000
+      },
+      "description": "Centre frequency of each band, in the order used by band_db and band_dev_db."
+    },
+    "score_weights": {
+      "type": "object",
+      "description": "The weights that produced the scores in this file. Recorded so the same data can be re-scored later.",
+      "properties": {
+        "fanning": {
+          "type": "number"
+        },
+        "agitation": {
+          "type": "number"
+        },
+        "piping": {
+          "type": "number"
+        },
+        "environment": {
+          "type": "number"
+        }
+      }
+    },
+    "minutes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "epoch",
+          "band_db"
+        ],
+        "properties": {
+          "epoch": {
+            "type": "integer"
+          },
+          "score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "temp_c": {
+            "type": "number"
+          },
+          "rh": {
+            "type": "number"
+          },
+          "band_db": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "nose_mean_kohm": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Mean gas resistance across the ten heater steps. Lower means more volatiles."
+          }
+        }
+      }
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "epoch",
+          "peak_score",
+          "band_dev_db"
+        ],
+        "properties": {
+          "epoch": {
+            "type": "integer"
+          },
+          "dur_s": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "peak_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "components": {
+            "type": "object",
+            "properties": {
+              "fanning": {
+                "type": "number"
+              },
+              "agitation": {
+                "type": "number"
+              },
+              "piping": {
+                "type": "number"
+              },
+              "environment": {
+                "type": "number"
+              }
+            }
+          },
+          "band_dev_db": {
+            "type": "array",
+            "description": "Band energy above this hive's baseline, in dB, at the peak. The raw material: any scoring scheme can be recomputed from it.",
+            "items": {
+              "type": "number"
+            }
+          },
+          "temp_c": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "rh": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "temp_rate_h": {
+            "type": "number"
+          },
+          "note": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "What was actually happening. An event without this is much less useful than one with it."
+          },
+          "nose_spec_kohm": {
+            "type": "array",
+            "minItems": 10,
+            "maxItems": 10,
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "description": "The ten-step fingerprint at the event peak, in kOhm. Raw material: any smell scoring can be recomputed from it."
+          },
+          "nose_dev": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "How far below its own baseline the mean gas resistance sat, 0..1. Higher means more volatiles than usual."
+          }
+        }
+      }
+    },
+    "nose_steps_c": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 10,
+      "items": {
+        "type": "number"
+      },
+      "description": "Heater temperature of each BME688 step, in the order used by nose_spec_kohm."
+    }
+  }
+}
