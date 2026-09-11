@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Apiary Ears acoustic clip",
+  "description": "A recording plus the context that makes it comparable with someone else's. The WAV sits beside this file with the same name.",
+  "type": "object",
+  "required": ["schema_version", "kind", "apiary_id", "file", "audio", "event"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "acoustic_clip" },
+    "apiary_id": { "type": "string", "pattern": "^[a-z0-9-]{3,40}$" },
+    "hive_id": { "type": "string", "maxLength": 40 },
+    "recorded_utc": { "type": "string" },
+    "file": { "type": "string", "description": "The WAV beside this file." },
+    "audio": {
+      "type": "object",
+      "required": ["sample_rate_hz"],
+      "properties": {
+        "sample_rate_hz": { "type": ["integer", "null"] },
+        "channels": { "type": ["integer", "null"] },
+        "bit_depth": { "type": ["integer", "null"] },
+        "duration_s": { "type": ["number", "null"] },
+        "bytes": { "type": "integer" }
+      }
+    },
+    "microphone": { "type": "string", "maxLength": 200,
+      "description": "Model and where it sits. A mic at the entrance and one over the brood nest hear different hives." },
+    "site": {
+      "type": "object",
+      "properties": {
+        "region": { "type": "string", "maxLength": 120 },
+        "climate": { "type": "string", "maxLength": 80 },
+        "hive_type": { "type": "string", "maxLength": 80 }
+      }
+    },
+    "event": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "enum": ["routine", "inspection", "swarm-issued", "swarm-preparation-suspected",
+                   "queenless-suspected", "robbing", "wasp-attack", "weather",
+                   "machinery-nearby", "other", "unknown"],
+          "description": "A fixed vocabulary on purpose: free text cannot be grouped across contributors."
+        },
+        "risk": { "type": ["number", "null"], "minimum": 0, "maximum": 100 },
+        "risk_scale": { "type": "string", "maxLength": 300 },
+        "confidence": { "enum": ["certain", "unsure"] },
+        "notes": { "type": "string", "maxLength": 1000 },
+        "capture_trigger": { "type": "string", "maxLength": 40,
+          "description": "manual, auto, scheduled - how the recording came to be made." }
+      }
+    },
+    "conditions_at_capture": {
+      "type": "object",
+      "description": "From the contributor's own sensors and calibration. Context, not a measurement comparable across sites.",
+      "additionalProperties": { "type": ["number", "string", "null"] }
+    },
+    "note_on_comparability": { "type": "string", "maxLength": 600 }
+  }
+}

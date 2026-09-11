@@ -1,8 +1,5 @@
 # Apiary Ears
 
-<img src="docs/img/apiary-ears-avatar.png" width="120" align="right" alt="">
-
-
 **Listening to a colony and smelling it at the same time, to find out whether a swarm
 announces itself before it goes.**
 
@@ -62,6 +59,7 @@ valuable thing a contributor does.
 | [BUILD.md](docs/BUILD.md) | IDE setup, the two libraries, flashing, what to check first |
 | [USAGE.md](docs/USAGE.md) | recording, reading the page, the API |
 | [SCORING.md](docs/SCORING.md) | exactly how the score works, and its limits |
+| [CLIPS.md](docs/CLIPS.md) | sharing recordings: the event vocabulary and why the WAV is the contribution |
 
 About $40 in parts. An afternoon.
 
