@@ -45,7 +45,24 @@
  *  before it. Every scan records its position in the burst, and the smell
  *  baseline ignores position 1 so the rest cycle cannot masquerade as a smell.
  *
- *  v1.0.0
+ *  BOTH SENSORS ARE REQUIRED, ON PURPOSE
+ *  This is one firmware for one board carrying a microphone AND a BME688. There
+ *  is no build option to run either alone, because the whole argument for the
+ *  build is the pair: sound moves in minutes, smell over hours, and a spike in
+ *  one without the other tells you which kind of thing just happened.
+ *
+ *  WHY THERE IS NO CO2 READING
+ *  The BME688 can report a CO2-EQUIVALENT, but only through BSEC's IAQ mode and
+ *  only after that algorithm completes an internal run-in. Measured on a node
+ *  that tried: fourteen scheduled IAQ windows, first at 15 minutes and then at
+ *  30, produced no value at all - every return to scan mode discards the
+ *  progress. Reaching run-in appears to need IAQ running CONTINUOUSLY, which
+ *  would cost the fingerprint entirely. So this firmware does not offer CO2
+ *  rather than offering a figure that is usually stale. If you want CO2 in a
+ *  hive, an SCD41 on the same two wires measures it with an NDIR sensor and
+ *  does not compete for the heater.
+ *
+ *  v1.1.0
  * =============================================================================
  */
 
@@ -61,7 +78,7 @@
 #define WIFI_SSID       "YOUR_WIFI"
 #define WIFI_PASS       "YOUR_PASSWORD"
 #define NODE_NAME       "apiary-ears"
-#define FW_VERSION      "1.0.0"
+#define FW_VERSION      "1.1.0"
 
 #define I2S_SD          4
 #define I2S_WS          5

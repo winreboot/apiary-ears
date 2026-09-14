@@ -82,3 +82,16 @@ look at alongside your own eyes, not as a warning system.
 
 If you catch a swarm on this, the recording either side of it is the single most valuable
 file this project could receive.
+
+## Why the environment term uses smell and not CO₂
+
+A BME688 can report a CO₂-equivalent, but only through BSEC's IAQ mode, and only after
+that algorithm reaches an internal run-in. A node that tried ran fourteen scheduled
+windows — 15 minutes, then 30 — and produced no value at all: every return to scan mode
+discards the run-in progress. Getting there needs IAQ running continuously, which costs
+the fingerprint.
+
+So the environment component uses what this sensor measures well — the gas resistance
+moving against its own baseline, and the temperature trend — rather than a figure that
+would be inferred, occasional and usually stale. If you want CO₂ alongside, fit an SCD41
+on the same two wires.

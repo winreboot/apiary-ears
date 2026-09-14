@@ -59,7 +59,7 @@ valuable thing a contributor does.
 | [BUILD.md](docs/BUILD.md) | IDE setup, the two libraries, flashing, what to check first |
 | [USAGE.md](docs/USAGE.md) | recording, reading the page, the API |
 | [SCORING.md](docs/SCORING.md) | exactly how the score works, and its limits |
-| [CLIPS.md](docs/CLIPS.md) | sharing recordings: the event vocabulary and why the WAV is the contribution |
+| [CLIPS.md](docs/CLIPS.md) | sharing recordings: the event vocabulary, and why the WAV is the contribution |
 
 About $40 in parts. An afternoon.
 
