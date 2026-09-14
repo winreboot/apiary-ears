@@ -2,6 +2,24 @@
 
 Versions are the `FW_VERSION` in `firmware/apiary_ears/apiary_ears.ino`.
 
+## 1.3.0 — 2026-09-14
+
+**Fix things without walking back to the computer.**
+
+- **↻ Self-check.** Re-probes the I²C bus, retries the BME688 if it had gone missing, and
+  takes a fresh microphone reading. Plug a cable back in, press it, and the diagnostics
+  update — no reboot, no reflash. It reports what changed ("missing → ok. Found it.").
+- **Restart node** from the page, with a confirmation that says what survives (recordings)
+  and what does not (the score baseline, the events list). The page then watches for the
+  board coming back and tells you when it is up.
+- **Rail voltage, if you fit two resistors.** See [docs/WIRING.md](docs/WIRING.md). The
+  Node panel shows 3.3 V and optionally 5 V, coloured green / honey / red, plus **the
+  minimum seen in the last minute** whenever it differs — because the sag during a heater
+  pulse is what resets sensors, not the average. Unfitted monitors say "not wired" rather
+  than showing a made-up figure.
+
+Flash this one.
+
 ## 1.2.0 — 2026-09-14
 
 **Recordings survive a reboot, the board manages its own flash, and the page gained the

@@ -70,7 +70,17 @@
  *  keeping at most CLIP_KEEP of them and never filling the partition. The page
  *  shows what is used and what is left. Download anything you want to keep.
  *
- *  v1.2.0
+ *  RAIL VOLTAGE (optional, two resistors)
+ *  An ESP32 cannot read its own supply directly, so measuring it needs a divider:
+ *  two 100k resistors from 3V3 to GND, their midpoint to VMON_33_PIN. For the 5 V
+ *  rail use 100k/47k to VMON_5V_PIN. Set the pins below; leave them at -1 and the
+ *  page simply says the monitor is not fitted rather than inventing a number.
+ *
+ *  What matters is not the average but the SAG: the BME688's heater and the
+ *  microphone draw in bursts, and a rail that reads 3.30 V but dips to 2.95 V
+ *  during a pulse is what resets sensors on a long cable. The page shows both.
+ *
+ *  v1.3.0
  * =============================================================================
  */
 
@@ -87,13 +97,19 @@
 #define WIFI_SSID       "YOUR_WIFI"
 #define WIFI_PASS       "YOUR_PASSWORD"
 #define NODE_NAME       "apiary-ears"
-#define FW_VERSION      "1.2.0"
+#define FW_VERSION      "1.3.0"
 
 #define I2S_SD          4
 #define I2S_WS          5
 #define I2S_SCK         6
 #define SAMPLE_RATE     16000
 #define WIN_SAMPLES     4096       // 256 ms per analysis window
+
+// Rail monitoring. -1 = not fitted; see the header above for the divider.
+#define VMON_33_PIN     -1         // ADC pin on the midpoint of 100k/100k from 3V3
+#define VMON_33_RATIO   2.00f
+#define VMON_5V_PIN     -1         // ADC pin on the midpoint of 100k/47k from 5V
+#define VMON_5V_RATIO   3.13f
 
 #define I2C_SDA         21
 #define I2C_SCL         13
@@ -192,6 +208,10 @@ uint8_t  g_evCount = 0;
 bool     g_inEvent = false;
 uint8_t  g_onStreak = 0;
 uint32_t g_lastEventEnd = 0;
+
+// rail voltage, sampled often so the minimum catches a sag rather than an average
+float    g_v33 = NAN, g_v33Min = NAN, g_v5 = NAN, g_v5Min = NAN;
+uint32_t g_vMs = 0, g_vWindowMs = 0;
 
 int16_t* g_clipBuf = nullptr;
 size_t   g_clipCap = 0, g_clipLen = 0;
@@ -422,6 +442,30 @@ static void noseBegin() {
   g_noseOk = true;
   Serial.printf("[bme688] found at 0x%02X, scan mode (10 heater steps, ~11 s per scan)\n", g_bmeAddr);
   Serial.println("[bme688] a new sensor needs 24-48 h of running before its gas readings settle.");
+}
+
+// ------------------------------------------------------------------ volts ---
+// An ESP32 cannot read its own rail, so this needs the divider described in the
+// header. analogReadMilliVolts applies the chip's factory ADC calibration, which
+// is good to a few tens of millivolts - fine for spotting a sagging supply.
+static float readRail(int pin, float ratio) {
+  if (pin < 0) return NAN;
+  uint32_t mv = 0;
+  for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(pin);
+  return (mv / 8.0f) * ratio / 1000.0f;
+}
+
+static void voltsService() {
+  if (millis() - g_vMs < 500) return;
+  g_vMs = millis();
+  float a = readRail(VMON_33_PIN, VMON_33_RATIO);
+  float b = readRail(VMON_5V_PIN, VMON_5V_RATIO);
+  if (!isnan(a)) { g_v33 = a; if (isnan(g_v33Min) || a < g_v33Min) g_v33Min = a; }
+  if (!isnan(b)) { g_v5  = b; if (isnan(g_v5Min)  || b < g_v5Min)  g_v5Min  = b; }
+  if (millis() - g_vWindowMs > 60000UL) {     // a fresh minimum every minute
+    g_vWindowMs = millis();
+    g_v33Min = g_v33; g_v5Min = g_v5;
+  }
 }
 
 // ------------------------------------------------------------------- clips --
@@ -813,6 +857,13 @@ static void handleNode() {
        ",\"psram\":" + String((unsigned long)ESP.getFreePsram()) +
        ",\"rssi\":" + String(WiFi.RSSI()) +
        ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  j += ",\"volts\":{";
+  j += "\"v33\":{\"fitted\":" + String(VMON_33_PIN >= 0 ? "true" : "false") +
+       ",\"now\":" + (isnan(g_v33) ? String("null") : String(g_v33, 3)) +
+       ",\"min\":" + (isnan(g_v33Min) ? String("null") : String(g_v33Min, 3)) + "},";
+  j += "\"v5\":{\"fitted\":" + String(VMON_5V_PIN >= 0 ? "true" : "false") +
+       ",\"now\":" + (isnan(g_v5) ? String("null") : String(g_v5, 3)) +
+       ",\"min\":" + (isnan(g_v5Min) ? String("null") : String(g_v5Min, 3)) + "}}";
   j += ",\"storage\":{\"total\":" + String((unsigned long)fsTotal()) +
        ",\"used\":" + String((unsigned long)fsUsed()) +
        ",\"free\":" + String((unsigned long)fsFree()) +
@@ -855,6 +906,39 @@ static void handleNode() {
            "but exports are harder to line up with anyone else's. Check the network allows outbound NTP.\"") + "}";
   j += "]}";
   sendJson(j);
+}
+
+// POST /api/selfcheck - look again, now that you have changed something.
+// Re-probes the bus and retries the sensor if it was missing, so plugging a
+// cable back in does not need a reboot.
+static void handleSelfCheck() {
+  String before = g_noseOk ? "ok" : "missing";
+  if (!g_noseOk) {
+    Serial.println("[selfcheck] BME688 was missing - probing again");
+    noseBegin();
+  } else {
+    g_bmeAddr = i2cPing(BME_ADDR_A) ? BME_ADDR_A : (i2cPing(BME_ADDR_B) ? BME_ADDR_B : 0);
+    if (!g_bmeAddr) {
+      Serial.println("[selfcheck] BME688 stopped answering - re-initialising");
+      g_noseOk = false;
+      noseBegin();
+    }
+  }
+  // give the microphone a moment to prove itself rather than reporting a stale level
+  static float mono[WIN_SAMPLES];
+  readWindow(mono, WIN_SAMPLES);
+  g_v33Min = g_v33; g_v5Min = g_v5;              // reset the sag window too
+
+  sendJson(String("{\"ok\":true,\"was\":\"") + before + "\",\"now\":\"" +
+           (g_noseOk ? "ok" : "missing") + "\",\"mic_dbfs\":" + String(g_dbfs, 1) + "}");
+}
+
+// POST /api/restart
+static void handleRestart() {
+  sendJson("{\"ok\":true,\"message\":\"restarting\"}");
+  Serial.println("[node] restart requested from the page");
+  delay(250);
+  ESP.restart();
 }
 
 static void handleExport() {
@@ -1009,7 +1093,11 @@ a{color:var(--honey)}
 <div class="card">
   <h2>Node</h2>
   <div id="nodeSummary" class="sub">…</div>
+  <div id="rails" style="margin:6px 0"></div>
   <button onclick="toggleNode()" id="nodeBtn">Show diagnostics</button>
+  <button onclick="selfCheck()" id="scBtn" title="Look again — use this after plugging a cable back in">&#8635; Self-check</button>
+  <button onclick="restartNode()" style="border-color:rgba(224,78,58,.5);color:#e04e3a">Restart node</button>
+  <div class="sub" id="scMsg" style="margin-top:6px"></div>
   <div id="nodeDetail" style="display:none;margin-top:8px"></div>
 </div>
 
@@ -1219,10 +1307,67 @@ function dur(s){
   const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60);
   return (d?d+'d ':'')+(h||d?h+'h ':'')+m+'m';
 }
+// Green while the rail is where it should be, honey when it is drooping, red
+// when it is somewhere that resets sensors. The MINIMUM is the interesting
+// number: heaters and radios draw in bursts.
+function railClass(v, nominal){
+  if(v==null) return ['', ''];
+  if(nominal===3.3){
+    if(v>=3.20 && v<=3.40) return ['#5fd39a','good'];
+    if(v>=3.05 && v<=3.50) return ['#e8b923','drooping'];
+    return ['#e04e3a', v<3.05?'too low':'too high'];
+  }
+  if(v>=4.75 && v<=5.25) return ['#5fd39a','good'];
+  if(v>=4.50 && v<=5.50) return ['#e8b923','drooping'];
+  return ['#e04e3a', v<4.5?'too low':'too high'];
+}
+function railChip(label, r, nominal){
+  if(!r || !r.fitted) return `<span class="sub" style="margin-right:12px">${label}: not wired</span>`;
+  const [c, word] = railClass(r.now, nominal);
+  const [cm]      = railClass(r.min, nominal);
+  const sag = (r.min!=null && r.now!=null && (r.now - r.min) >= 0.05)
+    ? ` <span style="color:${cm}">(dips to ${r.min.toFixed(2)})</span>` : '';
+  return `<span style="margin-right:14px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;
+            background:${c};margin-right:5px"></span>${label} <b>${r.now==null?'—':r.now.toFixed(2)} V</b>
+            <span class="sub">${word}</span>${sag}</span>`;
+}
+async function selfCheck(){
+  const b=el('scBtn'); b.textContent='\u21bb Checking\u2026'; b.disabled=true;
+  el('scMsg').textContent='';
+  try{
+    const r = await (await fetch('/api/selfcheck',{method:'POST'})).json();
+    let msg = `Sensor: ${r.was} \u2192 ${r.now}. Microphone at ${r.mic_dbfs.toFixed(0)} dBFS.`;
+    if(r.was!=='ok' && r.now==='ok') msg += ' Found it — it is back.';
+    else if(r.now!=='ok') msg += ' Still nothing on the bus; see the diagnostics below.';
+    el('scMsg').textContent = msg;
+  }catch(e){ el('scMsg').textContent='Could not reach the node.'; }
+  b.textContent='\u21bb Self-check'; b.disabled=false;
+  if(el('nodeDetail').style.display==='none') toggleNode(); else loadNode();
+  loadNose();
+}
+async function restartNode(){
+  if(!confirm('Restart the node?\n\nRecordings on flash survive. The score baseline and the '+
+              'events list do not — they are rebuilt after about a minute.')) return;
+  el('scMsg').textContent='Restarting\u2026';
+  try{ await fetch('/api/restart',{method:'POST'}); }catch(e){}
+  let n=0;
+  const t=setInterval(async()=>{
+    n++;
+    try{ await fetch('/api/node',{cache:'no-store'}); clearInterval(t);
+         el('scMsg').textContent='Back up.'; loadNode(); tick(); }
+    catch(e){ el('scMsg').textContent='Restarting\u2026 ('+n+'s)'; }
+    if(n>40){ clearInterval(t); el('scMsg').textContent='Not back yet — reload the page in a moment.'; }
+  }, 1000);
+}
 async function loadNode(){
   let N2; try{ N2=await (await fetch('/api/node')).json(); }catch(e){ return; }
   el('nodeSummary').textContent =
     `up ${dur(N2.uptime_s)} \u00b7 ${N2.die_c.toFixed(0)} \u00b0C die \u00b7 ${kb(N2.heap)} heap \u00b7 ${N2.rssi} dBm \u00b7 ${N2.ip}`;
+  const V=N2.volts||{};
+  el('rails').innerHTML = railChip('3.3 V', V.v33, 3.3) + railChip('5 V', V.v5, 5.0)
+    + ((V.v33 && V.v33.fitted) ? '' :
+       '<div class="sub" style="margin-top:4px">Two resistors add a rail monitor \u2014 see docs/WIRING.md. '
+       + 'Worth it on a long cable: a rail that reads fine but dips during a heater pulse is what resets sensors.</div>');
   const st=N2.storage||{};
   el('nodeDetail').innerHTML =
     (N2.inputs||[]).map(i=>
@@ -1279,6 +1424,10 @@ void setup() {
                   (unsigned)(fsTotal() / 1024), (unsigned)(fsFree() / 1024), clipCount(), CLIP_KEEP);
   }
 
+  if (VMON_33_PIN >= 0) analogSetPinAttenuation(VMON_33_PIN, ADC_11db);
+  if (VMON_5V_PIN >= 0) analogSetPinAttenuation(VMON_5V_PIN, ADC_11db);
+  g_vWindowMs = millis();
+
   audioBegin();
   noseBegin();
 
@@ -1305,6 +1454,8 @@ void setup() {
   server.on("/api/clip", handleClipFile);
   server.on("/api/clip/delete", handleClipDelete);
   server.on("/api/node", handleNode);
+  server.on("/api/selfcheck", handleSelfCheck);
+  server.on("/api/restart", handleRestart);
   server.begin();
   Serial.println("[http] listening on :80");
   Serial.println("[note] the score needs a minute to learn this hive's baseline before it means anything.");
@@ -1313,6 +1464,7 @@ void setup() {
 void loop() {
   server.handleClient();
   if (g_noseOk) nose.run();          // BSEC decides when to talk to the sensor
+  voltsService();
   if (g_clipRecording) { clipService(); return; }   // recording takes priority
   scoreWindow();
   eventService();

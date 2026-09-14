@@ -61,6 +61,19 @@ input: the microphone, the BME688 and the clock. Each says which pins are involv
 what to do when it is unhappy — a silent microphone suggests checking L/R is tied to GND
 before anything else, a missing BME688 suggests measuring 3.3 V at the sensor's own pins.
 
+**Rail voltage**, if you fit the two-resistor divider described in
+[WIRING.md](WIRING.md): the current reading, coloured green, honey or red, and the lowest
+it dipped to in the last minute. The dip is the useful number — a supply that looks fine
+until the heater pulses is exactly what resets a sensor on a long cable.
+
+**↻ Self-check** re-probes the bus, retries the sensor if it was missing, and takes a
+fresh microphone reading. Use it after plugging a cable back in: no reboot needed, and it
+tells you straight away whether the thing you just did worked.
+
+**Restart node** reboots the board. Recordings on flash survive; the score baseline and
+the events list do not, and take about a minute to rebuild. The page watches for the node
+coming back and says so.
+
 ## Exporting
 
 Label it, choose the minutes, download. You get minute-by-minute band energies, scores,
