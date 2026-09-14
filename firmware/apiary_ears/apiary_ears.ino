@@ -62,7 +62,15 @@
  *  hive, an SCD41 on the same two wires measures it with an NDIR sensor and
  *  does not compete for the heater.
  *
- *  v1.1.0
+ *  RECORDINGS ARE KEPT ON THE BOARD
+ *  Clips are written to LittleFS, not held in RAM, so they survive a reboot.
+ *  Flash is small: a ten-second 16 kHz mono clip is about 320 KB, so a typical
+ *  1.5 MB partition holds four or five. The board therefore MANAGES the space
+ *  itself - before every recording it makes room by deleting the oldest clips,
+ *  keeping at most CLIP_KEEP of them and never filling the partition. The page
+ *  shows what is used and what is left. Download anything you want to keep.
+ *
+ *  v1.2.0
  * =============================================================================
  */
 
@@ -70,6 +78,7 @@
 #include <WebServer.h>
 #include <Wire.h>
 #include <driver/i2s.h>
+#include <LittleFS.h>
 #include <bsec2.h>
 #include <math.h>
 #include <time.h>
@@ -78,7 +87,7 @@
 #define WIFI_SSID       "YOUR_WIFI"
 #define WIFI_PASS       "YOUR_PASSWORD"
 #define NODE_NAME       "apiary-ears"
-#define FW_VERSION      "1.1.0"
+#define FW_VERSION      "1.2.0"
 
 #define I2S_SD          4
 #define I2S_WS          5
@@ -96,6 +105,9 @@
 #define MINUTE_RING     1440       // 24 h of per-minute summaries
 #define EVENT_MAX       40
 #define CLIP_SECONDS    10
+#define CLIP_KEEP       6          // most recordings kept on flash; oldest go first
+#define CLIP_FREE_MIN   65536      // never leave the partition with less than this free
+#define NOSE_RING       300        // fingerprints kept for the spectrogram (~1 h of bursts)
 #define BURST_GAP_MS    30000UL    // a longer pause means a new burst began
 
 #define EVENT_ON        55         // score at or above this opens an event
@@ -143,6 +155,14 @@ float    g_tempPrev = NAN, g_tempRate = 0;
 uint32_t g_tempRateMs = 0;
 bool     g_noseOk = false;
 uint8_t  g_bmeAddr = 0;
+
+struct NoseRow {                         // one completed fingerprint
+  uint32_t epoch;
+  uint16_t kohm[NOSE_STEPS];             // clipped to 65535, plenty for this sensor
+  uint8_t  pos;                          // burst position; 1 = first after a rest
+};
+NoseRow  g_noseRing[NOSE_RING];
+uint16_t g_noseHead = 0, g_noseCount = 0;
 
 struct MinuteRow {
   uint32_t epoch;
@@ -319,6 +339,15 @@ void onNoseData(const bme68xData data, const bsecOutputs outputs, Bsec2 bsec) {
       memcpy(g_specLast, g_spec, sizeof(g_spec));
       g_noseSeq++;
 
+      NoseRow& nr = g_noseRing[g_noseHead];
+      time_t tt = time(nullptr);
+      nr.epoch = (tt > 1600000000) ? (uint32_t)tt : (millis() / 1000UL);
+      for (int k = 0; k < NOSE_STEPS; k++)
+        nr.kohm[k] = isnan(g_spec[k]) ? 0 : (uint16_t)fminf(fmaxf(g_spec[k], 0.0f), 65535.0f);
+      nr.pos = g_nosePos;
+      g_noseHead = (g_noseHead + 1) % NOSE_RING;
+      if (g_noseCount < NOSE_RING) g_noseCount++;
+
       float sum = 0; int n = 0;
       for (int k = 0; k < NOSE_STEPS; k++) if (!isnan(g_spec[k]) && g_spec[k] > 0) { sum += g_spec[k]; n++; }
       float mean = n ? sum / n : NAN;
@@ -396,6 +425,50 @@ static void noseBegin() {
 }
 
 // ------------------------------------------------------------------- clips --
+static void clipSave();                 // defined below, called from clipService()
+
+// ---- recordings on flash ---------------------------------------------------
+// Flash is small and a clip is ~320 KB, so the board keeps its own house: make
+// room before recording rather than failing afterwards.
+static size_t fsTotal() { return LittleFS.totalBytes(); }
+static size_t fsUsed()  { return LittleFS.usedBytes(); }
+static size_t fsFree()  { size_t t = fsTotal(), u = fsUsed(); return t > u ? t - u : 0; }
+
+static int clipCount() {
+  int n = 0;
+  File d = LittleFS.open("/clips");
+  if (!d || !d.isDirectory()) return 0;
+  for (File f = d.openNextFile(); f; f = d.openNextFile()) if (!f.isDirectory()) n++;
+  return n;
+}
+
+// The oldest clip is the one whose name sorts first: names begin with the epoch.
+static bool clipDeleteOldest() {
+  String oldest;
+  File d = LittleFS.open("/clips");
+  if (!d || !d.isDirectory()) return false;
+  for (File f = d.openNextFile(); f; f = d.openNextFile()) {
+    if (f.isDirectory()) continue;
+    String n = f.name();
+    if (n.startsWith("/")) n = n.substring(1);
+    if (!oldest.length() || n < oldest) oldest = n;
+  }
+  if (!oldest.length()) return false;
+  String path = "/clips/" + oldest;
+  Serial.printf("[clip] making room: deleting %s\n", path.c_str());
+  return LittleFS.remove(path);
+}
+
+static void clipMakeRoom(size_t needed) {
+  int guard = 0;
+  while (guard++ < 32) {
+    bool tooMany = clipCount() >= CLIP_KEEP;
+    bool tooFull = fsFree() < needed + CLIP_FREE_MIN;
+    if (!tooMany && !tooFull) return;
+    if (!clipDeleteOldest()) return;            // nothing left to delete
+  }
+}
+
 static void clipStart(const char* label) {
   if (!g_clipBuf || g_clipRecording) return;
   g_clipLen = 0;
@@ -417,7 +490,41 @@ static void clipService() {
   if (g_clipLen >= g_clipCap) {
     g_clipRecording = false;
     Serial.printf("[clip] done, %u samples\n", (unsigned)g_clipLen);
+    clipSave();
   }
+}
+
+// Name: <epoch>-<label>.wav, so a plain sort is a sort by age.
+static void clipSave() {
+  if (!g_clipLen || !g_clipBuf) return;
+  uint32_t bytes = g_clipLen * 2;
+  clipMakeRoom(bytes + 44);
+  if (fsFree() < bytes + 44) {
+    Serial.println("[clip] not enough flash even after housekeeping - clip kept in RAM only");
+    return;
+  }
+  char safe[32];
+  size_t j = 0;
+  for (size_t i = 0; g_clipLabel[i] && j < sizeof(safe) - 1; i++) {
+    char c = g_clipLabel[i];
+    safe[j++] = (isalnum((int)c)) ? c : '-';
+  }
+  safe[j] = 0;
+  char path[80];
+  snprintf(path, sizeof(path), "/clips/%lu-%s.wav", (unsigned long)g_clipEpoch, safe);
+  File f = LittleFS.open(path, "w");
+  if (!f) { Serial.printf("[clip] could not open %s for writing\n", path); return; }
+  uint8_t hdr[44];
+  writeWavHeader(hdr, bytes);
+  f.write(hdr, 44);
+  const size_t CH = 4096;
+  for (size_t off = 0; off < g_clipLen; off += CH) {
+    size_t n = min(CH, g_clipLen - off);
+    f.write((const uint8_t*)(g_clipBuf + off), n * 2);
+  }
+  f.close();
+  Serial.printf("[clip] saved %s (%u KB) - %d on flash, %u KB free\n",
+                path, (unsigned)((bytes + 44) / 1024), clipCount(), (unsigned)(fsFree() / 1024));
 }
 
 static void writeWavHeader(uint8_t* h, uint32_t dataBytes) {
@@ -619,6 +726,137 @@ static void handleListen() {
   c.stop();
 }
 
+// GET /api/nose/history?n=200 - fingerprints for the spectrogram and clustering
+static void handleNoseHistory() {
+  uint16_t want = server.hasArg("n") ? (uint16_t)server.arg("n").toInt() : 200;
+  if (want < 10) want = 10;
+  if (want > NOSE_RING) want = NOSE_RING;
+  uint16_t take = (uint16_t)min<uint16_t>(want, g_noseCount);
+  bool settled = server.arg("settled") != "0";        // hide post-rest scans by default
+
+  String j = "{\"ok\":true,\"steps_c\":[";
+  for (int k = 0; k < NOSE_STEPS; k++) { if (k) j += ','; j += String(HEATER_C[k]); }
+  j += "],\"scans\":[";
+  bool first = true;
+  for (uint16_t i = 0; i < take; i++) {
+    const NoseRow& r = g_noseRing[(g_noseHead + NOSE_RING - take + i) % NOSE_RING];
+    if (settled && r.pos == 1) continue;
+    if (!first) j += ',';
+    first = false;
+    j += "{\"epoch\":" + String(r.epoch) + ",\"pos\":" + String(r.pos) + ",\"g\":[";
+    for (int k = 0; k < NOSE_STEPS; k++) { if (k) j += ','; j += String(r.kohm[k]); }
+    j += "]}";
+  }
+  j += "]}";
+  sendJson(j);
+}
+
+// GET /api/clips - what is on flash, and how much room is left
+static void handleClipList() {
+  String j = "{\"ok\":true,\"storage\":{\"total\":" + String((unsigned long)fsTotal()) +
+             ",\"used\":" + String((unsigned long)fsUsed()) +
+             ",\"free\":" + String((unsigned long)fsFree()) +
+             ",\"keep\":" + String(CLIP_KEEP) + "},\"clips\":[";
+  File d = LittleFS.open("/clips");
+  bool first = true;
+  if (d && d.isDirectory()) {
+    for (File f = d.openNextFile(); f; f = d.openNextFile()) {
+      if (f.isDirectory()) continue;
+      String n = f.name();
+      if (n.startsWith("/")) n = n.substring(1);
+      int dash = n.indexOf('-');
+      String ep = dash > 0 ? n.substring(0, dash) : "0";
+      String lb = dash > 0 ? n.substring(dash + 1) : n;
+      lb.replace(".wav", "");
+      if (!first) j += ',';
+      first = false;
+      j += "{\"name\":\"" + n + "\",\"epoch\":" + ep +
+           ",\"label\":\"" + lb + "\",\"bytes\":" + String((unsigned long)f.size()) + "}";
+    }
+  }
+  j += "]}";
+  sendJson(j);
+}
+
+static void handleClipFile() {
+  String n = server.arg("name");
+  if (!n.length() || n.indexOf("..") >= 0 || n.indexOf('/') >= 0) {
+    server.send(400, "text/plain", "bad name\n"); return;
+  }
+  String path = "/clips/" + n;
+  File f = LittleFS.open(path, "r");
+  if (!f) { server.send(404, "text/plain", "no such recording\n"); return; }
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + n + "\"");
+  server.streamFile(f, "audio/wav");
+  f.close();
+}
+
+static void handleClipDelete() {
+  String n = server.arg("name");
+  if (!n.length() || n.indexOf("..") >= 0 || n.indexOf('/') >= 0) {
+    sendJson("{\"ok\":false,\"error\":\"bad name\"}"); return;
+  }
+  bool ok = LittleFS.remove("/clips/" + n);
+  sendJson(String("{\"ok\":") + (ok ? "true" : "false") + "}");
+}
+
+// GET /api/node - uptime, board health, and a verdict per input with what to do
+static void handleNode() {
+  uint32_t up = (millis()) / 1000UL;
+  bool micOk = (g_dbfs > -119.0f);
+  bool noseFresh = g_noseLastMs && (millis() - g_noseLastMs < 180000UL);
+
+  String j = "{\"ok\":true,\"fw\":\"" FW_VERSION "\",\"node\":\"" NODE_NAME "\",";
+  j += "\"uptime_s\":" + String(up) +
+       ",\"die_c\":" + String(temperatureRead(), 1) +
+       ",\"heap\":" + String((unsigned long)ESP.getFreeHeap()) +
+       ",\"psram\":" + String((unsigned long)ESP.getFreePsram()) +
+       ",\"rssi\":" + String(WiFi.RSSI()) +
+       ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  j += ",\"storage\":{\"total\":" + String((unsigned long)fsTotal()) +
+       ",\"used\":" + String((unsigned long)fsUsed()) +
+       ",\"free\":" + String((unsigned long)fsFree()) +
+       ",\"clips\":" + String(clipCount()) + ",\"keep\":" + String(CLIP_KEEP) + "}";
+
+  j += ",\"inputs\":[";
+  // microphone
+  j += String("{\"name\":\"INMP441 microphone\",\"pins\":\"SD GPIO") + String(I2S_SD) +
+       " / WS GPIO" + String(I2S_WS) + " / SCK GPIO" + String(I2S_SCK) + " / L\u002fR to GND\"" +
+       ",\"ok\":" + (micOk ? "true" : "false") +
+       ",\"detail\":\"" + String(g_dbfs, 0) + " dBFS" + (g_clip ? ", CLIPPING" : "") + "\"" +
+       ",\"verdict\":\"" + String(micOk
+         ? (g_clip ? "Audio is arriving but the input is clipping. Move the microphone further from the entrance or recess it behind a baffle.\""
+                   : "Audio is arriving.\"")
+         : "Silent. Check L\u002fR is tied to GND, then that SD, WS and SCK are on the pins above. "
+           "A mis-wired INMP441 fails quietly. The mic also sleeps if the bit clock drops below about 1 MHz, "
+           "so do not lower SAMPLE_RATE much.\"") + "}";
+  // BME688
+  j += String(",{\"name\":\"BME688 gas sensor\",\"pins\":\"SDA GPIO") + String(I2C_SDA) +
+       " / SCL GPIO" + String(I2C_SCL) + " / VCC 3V3 / GND\"" +
+       ",\"ok\":" + ((g_noseOk && noseFresh) ? "true" : "false") +
+       ",\"detail\":\"" + (g_bmeAddr ? ("0x" + String(g_bmeAddr, HEX) + ", " + String(g_noseSeq) + " scans")
+                                        : String("not found on the bus")) + "\"" +
+       ",\"verdict\":\"" + String(!g_bmeAddr
+         ? "Nothing answers at 0x77 or 0x76. Measure 3.3 V at the sensor's own pins first. "
+           "Then check SDA - on many breakouts it is the pin marked MOSI - and SCL. "
+           "Then the address switch. Reseating the connector has fixed this before.\""
+         : (!noseFresh ? "On the bus but no recent scan. Usually a marginal supply on a long cable: "
+                         "shorten it, or fit a capacitor at the sensor.\""
+                       : "Scanning normally.\"")) + "}";
+  // clock, because timestamps in exports depend on it
+  time_t tt = time(nullptr);
+  bool clockOk = tt > 1600000000;
+  j += String(",{\"name\":\"Clock (NTP)\",\"pins\":\"network\"") +
+       ",\"ok\":" + (clockOk ? "true" : "false") +
+       ",\"detail\":\"" + (clockOk ? String("synced") : String("not set")) + "\"" +
+       ",\"verdict\":\"" + String(clockOk
+         ? "Recordings and labels carry real timestamps.\""
+         : "No NTP yet, so timestamps fall back to seconds since boot. Harmless locally, "
+           "but exports are harder to line up with anyone else's. Check the network allows outbound NTP.\"") + "}";
+  j += "]}";
+  sendJson(j);
+}
+
 static void handleExport() {
   uint32_t mins = server.hasArg("minutes") ? (uint32_t)server.arg("minutes").toInt() : 60;
   if (mins < 1) mins = 1;
@@ -672,6 +910,11 @@ static const char PAGE[] PROGMEM = R"HTML(<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Apiary Ears</title>
 <style>
+.pat{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+.pat>div{border:1px solid var(--edge);border-radius:10px;padding:8px 10px}
+.pat .bars{height:34px}
+.ok{color:#5fd39a}.bad{color:#e04e3a}
+.diag{border:1px solid var(--edge);border-radius:10px;padding:9px 11px;margin-bottom:8px}
 :root{--bg:#14110c;--pan:#1b1712;--edge:rgba(232,185,35,.22);--honey:#e8b923;--cream:#e9dcc3;--mut:#9a8a6a;--crit:#e04e3a}
 *{box-sizing:border-box}
 body{background:var(--bg);color:var(--cream);font:14px/1.5 system-ui,sans-serif;margin:auto;padding:18px;max-width:880px}
@@ -727,6 +970,19 @@ a{color:var(--honey)}
 </div>
 
 <div class="card">
+  <h2>Fingerprint over time</h2>
+  <canvas id="spec" width="840" height="190"></canvas>
+  <div class="lab"><span id="specFrom"></span><span>rows = heater steps · brighter = more gas at that temperature</span><span>now</span></div>
+  <div class="note">Each column is one scan. A smell arriving shows as a vertical band; which rows light up is the shape that tells one smell from another.</div>
+</div>
+
+<div class="card">
+  <h2>Recurring patterns</h2>
+  <div class="pat" id="pats"></div>
+  <div class="note">Fingerprint shapes grouped automatically, intensity divided out. Same colour = the same kind of mixture. A new pattern appearing means something changed, before anything has been trained.</div>
+</div>
+
+<div class="card">
   <h2>Score, smell and temperature</h2>
   <canvas id="hist" width="840" height="190"></canvas>
   <div class="lab"><span id="histFrom"></span><span>honey = score · green = smell (lower resistance is more gas) · grey = temperature</span><span>now</span></div>
@@ -735,10 +991,26 @@ a{color:var(--honey)}
 
 <div class="card">
   <h2>Listen and record</h2>
-  <button onclick="listen()">▶ Live listen</button>
+  <button id="listenBtn" onclick="listen()">▶ Live listen</button>
+  <audio id="liveAudio" style="display:none;width:100%;margin-top:8px" controls></audio>
   <input id="recLabel" placeholder="what is this? e.g. inspection, calm evening" maxlength="39" style="width:42%">
   <button onclick="record()">● Record 10 s</button>
   <div class="note" id="recMsg">Live listen streams the microphone straight to your browser. Recording captures ten seconds into memory — download it before the board reboots.</div>
+</div>
+
+<div class="card">
+  <h2>Recordings kept on the board</h2>
+  <div class="meter" style="height:12px"><i id="stBar" style="width:0%"></i></div>
+  <div class="lab"><span id="stText">reading storage…</span><span id="stKeep"></span></div>
+  <div id="clips" style="margin-top:8px"></div>
+  <div class="note">Flash is small: about five ten-second clips fit. The board deletes the oldest before recording a new one, so it never runs out — download anything worth keeping.</div>
+</div>
+
+<div class="card">
+  <h2>Node</h2>
+  <div id="nodeSummary" class="sub">…</div>
+  <button onclick="toggleNode()" id="nodeBtn">Show diagnostics</button>
+  <div id="nodeDetail" style="display:none;margin-top:8px"></div>
 </div>
 
 <div class="card">
@@ -848,7 +1120,121 @@ async function note(ep,cur){
   await fetch(`/api/note?epoch=${ep}&text=${encodeURIComponent(t)}`,{method:'POST'});
   loadEvents();
 }
-function listen(){ window.open('/listen.wav','_blank'); }
+// Live listen plays in the page rather than opening a window: the charts keep
+// updating while you listen, which is half the point of listening.
+function listen(){
+  const a = el('liveAudio'), b = el('listenBtn');
+  if(!a.paused && a.src){ a.pause(); a.removeAttribute('src'); a.load(); a.style.display='none';
+                          b.textContent='\u25b6 Live listen'; b.classList.remove('on'); return; }
+  a.src = '/listen.wav?t=' + Date.now();     // fresh URL so the browser does not reuse a finished stream
+  a.style.display = 'block';
+  a.play().then(()=>{ b.textContent='\u25a0 Stop listening'; b.classList.add('on'); })
+          .catch(e=>{ el('recMsg').textContent =
+            'The browser would not play the stream. Open http://'+location.host+'/listen.wav directly, or use VLC.'; });
+}
+function colour(f){
+  const st=[[0,[27,16,48]],[.3,[42,111,151]],[.55,[29,158,117]],[.8,[232,185,35]],[1,[224,78,58]]];
+  f=Math.max(0,Math.min(1,f)); let a=st[0],b=st[st.length-1];
+  for(let i=0;i<st.length-1;i++) if(f>=st[i][0]&&f<=st[i+1][0]){a=st[i];b=st[i+1];break}
+  const t=(f-a[0])/Math.max(1e-6,b[0]-a[0]), c=a[1].map((v,i)=>Math.round(v+(b[1][i]-v)*t));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+let NH=null;
+async function loadNose(){
+  try{ NH = await (await fetch('/api/nose/history?n=240')).json(); }catch(e){ return; }
+  drawSpec(); patterns();
+}
+function drawSpec(){
+  const cv=el('spec'), c=cv.getContext('2d'), W=cv.width, H=cv.height;
+  c.fillStyle='#0d0b07'; c.fillRect(0,0,W,H);
+  const S=(NH&&NH.scans)||[]; const n=S.length;
+  if(!n){ c.fillStyle='#9a8a6a'; c.font='12px system-ui';
+          c.fillText('waiting for the first complete scan',16,H/2); return; }
+  const rows=10, rh=(H-4)/rows, cw=Math.max(1,W/n), lo=[], hi=[];
+  for(let k=0;k<rows;k++){ const col=S.map(s=>s.g[k]).filter(v=>v>0);
+    lo[k]=col.length?Math.min(...col):0; hi[k]=col.length?Math.max(...col):1; }
+  for(let i=0;i<n;i++) for(let k=0;k<rows;k++){
+    const v=S[i].g[k]; if(!v) continue;
+    c.fillStyle=colour(1-(v-lo[k])/Math.max(1e-6,hi[k]-lo[k]));
+    c.fillRect(i*cw,k*rh,Math.ceil(cw),Math.ceil(rh));
+  }
+  c.fillStyle='#9a8a6a'; c.font='10px system-ui';
+  for(let k=0;k<rows;k++) c.fillText(`${k}\u00b7${(NH.steps_c||[])[k]||''}\u00b0`,3,k*rh+rh/2+3);
+  const t0=S[0].epoch;
+  el('specFrom').textContent = t0>1600000000 ? new Date(t0*1000).toLocaleString() : '';
+}
+function patterns(){
+  const S=(NH&&NH.scans)||[], n=S.length, k=4;
+  if(n<8){ el('pats').innerHTML='<div class="note">Needs at least eight scans to group shapes.</div>'; return; }
+  const mean=g=>{const v=g.filter(x=>x>0); return v.length?v.reduce((a,b)=>a+b,0)/v.length:1};
+  const rows=S.map(s=>{const m=mean(s.g); return s.g.map(v=>v>0?v/m:1)});
+  const order=rows.map((r,i)=>[mean(S[i].g),i]).sort((a,b)=>a[0]-b[0]);
+  let P=[0,1,2,3].map(j=>rows[order[Math.floor((j+.5)*n/k)][1]].slice());
+  let A=new Array(n).fill(0);
+  const dist=(a,b)=>a.reduce((s,x,i)=>s+(x-b[i])*(x-b[i]),0);
+  for(let it=0;it<12;it++){
+    const sum=P.map(()=>new Array(10).fill(0)), cnt=new Array(k).fill(0);
+    rows.forEach((r,i)=>{ let bi=0,bd=Infinity; P.forEach((p,j)=>{const d=dist(r,p); if(d<bd){bd=d;bi=j}});
+      A[i]=bi; cnt[bi]++; r.forEach((x,c2)=>sum[bi][c2]+=x); });
+    P=P.map((p,j)=>cnt[j]?sum[j].map(x=>x/cnt[j]):p);
+  }
+  const cols=['#7A9BFF','#5fd39a','#F2A623','#E06AA3'], names=['A','B','C','D'];
+  el('pats').innerHTML=P.map((p,j)=>{
+    const cnt=A.filter(x=>x===j).length, mx=Math.max(...p);
+    return `<div><div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px">
+      <b style="color:${cols[j]}">Pattern ${names[j]}</b><span>${Math.round(100*cnt/n)}% of scans</span></div>
+      <div class="bars">${p.map(v=>`<i style="height:${Math.max(2,Math.round(34*v/mx))}px;background:${cols[j]}"></i>`).join('')}</div></div>`;
+  }).join('');
+}
+function kb(b){ return b>=1048576 ? (b/1048576).toFixed(1)+' MB' : Math.round(b/1024)+' KB'; }
+async function loadClips(){
+  let C; try{ C=await (await fetch('/api/clips')).json(); }catch(e){ return; }
+  const st=C.storage||{total:0,used:0,free:0};
+  const pct = st.total ? Math.round(100*st.used/st.total) : 0;
+  el('stBar').style.width = pct+'%';
+  el('stBar').style.background = pct>85 ? '#e04e3a' : (pct>65 ? '#e8b923' : '#5fd39a');
+  el('stText').textContent = `${kb(st.used)} used of ${kb(st.total)} \u00b7 ${kb(st.free)} free`;
+  el('stKeep').textContent = `${(C.clips||[]).length} of ${st.keep} kept`;
+  const rows=(C.clips||[]).slice().sort((a,b)=>b.epoch-a.epoch);
+  el('clips').innerHTML = rows.length ? '<table>'+rows.map(c=>
+    `<tr><td>${c.epoch>1600000000?new Date(c.epoch*1000).toLocaleString():c.epoch+' s'}</td>
+     <td>${c.label}</td><td>${kb(c.bytes)}</td>
+     <td style="text-align:right"><a href="/api/clip?name=${encodeURIComponent(c.name)}">download</a>
+     <span class="x" title="delete" onclick="delClip('${c.name}')">\u2715</span></td></tr>`).join('')+'</table>'
+    : '<div class="note">Nothing recorded yet.</div>';
+}
+async function delClip(n){
+  if(!confirm('Delete this recording from the board?')) return;
+  await fetch('/api/clip/delete?name='+encodeURIComponent(n), {method:'POST'});
+  loadClips();
+}
+function toggleNode(){
+  const d=el('nodeDetail'), b=el('nodeBtn');
+  const show = d.style.display==='none';
+  d.style.display = show ? 'block' : 'none';
+  b.textContent = show ? 'Hide diagnostics' : 'Show diagnostics';
+  if(show) loadNode();
+}
+function dur(s){
+  const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60);
+  return (d?d+'d ':'')+(h||d?h+'h ':'')+m+'m';
+}
+async function loadNode(){
+  let N2; try{ N2=await (await fetch('/api/node')).json(); }catch(e){ return; }
+  el('nodeSummary').textContent =
+    `up ${dur(N2.uptime_s)} \u00b7 ${N2.die_c.toFixed(0)} \u00b0C die \u00b7 ${kb(N2.heap)} heap \u00b7 ${N2.rssi} dBm \u00b7 ${N2.ip}`;
+  const st=N2.storage||{};
+  el('nodeDetail').innerHTML =
+    (N2.inputs||[]).map(i=>
+      `<div class="diag"><div style="display:flex;justify-content:space-between">
+         <b class="${i.ok?'ok':'bad'}">${i.ok?'OK':'CHECK'} \u00b7 ${i.name}</b>
+         <span class="sub">${i.detail}</span></div>
+       <div style="margin-top:3px">${i.verdict}</div>
+       <div class="sub" style="margin-top:3px;font-family:ui-monospace,monospace">${i.pins}</div></div>`).join('')
+    + `<div class="diag"><b>Storage</b><div>${kb(st.used)} of ${kb(st.total)} used, ${kb(st.free)} free, `
+    + `${st.clips} recording(s) of at most ${st.keep}. The oldest are deleted automatically before a new one is recorded.</div></div>`;
+}
+setInterval(()=>{ if(el('nodeDetail').style.display!=='none') loadNode(); }, 10000);
 async function record(){
   const l=el('recLabel').value.trim()||'manual';
   const r=await (await fetch('/api/record?label='+encodeURIComponent(l),{method:'POST'})).json();
@@ -859,8 +1245,9 @@ function exportJson(){
   const l=el('xpLabel').value.trim(); if(!l){ alert('Give the export a label first.'); return; }
   window.location=`/api/export?label=${encodeURIComponent(l)}&minutes=${el('xpMins').value}`;
 }
-tick(); loadHist(); loadEvents();
+tick(); loadHist(); loadEvents(); loadNose(); loadClips(); loadNode();
 setInterval(tick,2000); setInterval(loadHist,60000); setInterval(loadEvents,30000);
+setInterval(loadNose,20000); setInterval(loadClips,30000);
 </script></body></html>)HTML";
 
 static void handleRoot() { server.send_P(200, "text/html", PAGE); }
@@ -883,6 +1270,15 @@ void setup() {
 
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
+  if (!LittleFS.begin(true)) {
+    Serial.println("[fs] LittleFS would not mount - recordings will not be kept.");
+    Serial.println("     In the IDE: Tools -> Partition Scheme -> one with a SPIFFS/LittleFS area.");
+  } else {
+    if (!LittleFS.exists("/clips")) LittleFS.mkdir("/clips");
+    Serial.printf("[fs] %u KB total, %u KB free, %d recording(s) kept (max %d)\n",
+                  (unsigned)(fsTotal() / 1024), (unsigned)(fsFree() / 1024), clipCount(), CLIP_KEEP);
+  }
+
   audioBegin();
   noseBegin();
 
@@ -904,6 +1300,11 @@ void setup() {
   server.on("/api/export", handleExport);
   server.on("/clip.wav", handleClipWav);
   server.on("/listen.wav", handleListen);
+  server.on("/api/nose/history", handleNoseHistory);
+  server.on("/api/clips", handleClipList);
+  server.on("/api/clip", handleClipFile);
+  server.on("/api/clip/delete", handleClipDelete);
+  server.on("/api/node", handleNode);
   server.begin();
   Serial.println("[http] listening on :80");
   Serial.println("[note] the score needs a minute to learn this hive's baseline before it means anything.");

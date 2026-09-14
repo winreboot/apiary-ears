@@ -35,6 +35,11 @@ whole argument for this build.
   unusual *for this hive*, keeping the frequency breakdown, the ten-step smell fingerprint,
   the temperature and how fast it is changing.
 
+The page also shows the **fingerprint over time** as a spectrogram, groups **recurring
+patterns** automatically, lists the **recordings held on the board** with how much flash is
+left, and has a **Node panel** giving uptime, temperature and a per-input diagnosis with
+the steps to fix whatever is unhappy.
+
 **Every event is scored** so events can be compared between hives and between apiaries:
 0–100, built from fanning (60–180 Hz), agitation (225–315 Hz), piping (360–500 Hz) and an
 environment term from the smell and the temperature trend. Everything is measured against

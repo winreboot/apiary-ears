@@ -41,6 +41,26 @@ they were calm." All three are valuable, and a week later you will not remember.
 A dataset of unlabelled score spikes teaches nobody anything. One where half the events say
 what happened is the first of its kind.
 
+## Recordings and storage
+
+Clips are written to the board's flash, so they survive a reboot. Flash is small: a
+ten-second 16 kHz mono clip is about 320 KB, and a typical partition holds four or five.
+
+The board manages that itself. Before each recording it deletes the oldest clips until
+there is room, keeps at most six, and never fills the partition completely. The page shows
+usage as a bar — green, then honey, then red as it fills — with a download link beside each
+recording. **Download anything worth keeping**; it will eventually be deleted to make room.
+
+To keep more, raise `CLIP_KEEP` and choose a partition scheme with a larger filesystem
+(Tools → Partition Scheme), or lower `CLIP_SECONDS`.
+
+## The Node panel
+
+Uptime, die temperature, heap, PSRAM, signal strength and IP, plus a verdict for each
+input: the microphone, the BME688 and the clock. Each says which pins are involved and
+what to do when it is unhappy — a silent microphone suggests checking L/R is tied to GND
+before anything else, a missing BME688 suggests measuring 3.3 V at the sensor's own pins.
+
 ## Exporting
 
 Label it, choose the minutes, download. You get minute-by-minute band energies, scores,
