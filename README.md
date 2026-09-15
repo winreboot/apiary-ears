@@ -71,6 +71,16 @@ valuable thing a contributor does.
 
 About $40 in parts. An afternoon.
 
+## Optional AI analysis
+
+Since firmware 1.6 the page has an **Analyze hive** button. It sends the current numbers
+(score, band deviations, gas fingerprint, an hour of summaries, recent events — never audio)
+to a language model and shows a short structured reading under fixed headings. It is off
+until you paste your own API key on the board's page: **OpenRouter** (free models available)
+or the **OpenAI API** (paid, separate from a ChatGPT subscription). The firmware ships with no
+key, the key never leaves the ESP32's NVS, and nothing is sent until you press the button.
+Setup, what is transmitted, and the honest limits are in [docs/AI-ANALYSIS.md](docs/AI-ANALYSIS.md).
+
 ## Contribute recordings
 
 What would make this project real:

@@ -82,24 +82,31 @@
  *  is one sample every ~150 s, ample for something that moves over hours. The
  *  raw per-scan view still shows everything, because that is what raw means.
  *
- *  v1.5.0
+ *  v1.6.4 — OpenRouter free-router reasoning/content compatibility
  * =============================================================================
  */
 
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 #include <Wire.h>
 #include <driver/i2s.h>
 #include <LittleFS.h>
 #include <bsec2.h>
 #include <math.h>
 #include <time.h>
+#include <esp_heap_caps.h>
 
 // ---------------------------------------------------------------- settings --
 #define WIFI_SSID       "YOUR_WIFI"
 #define WIFI_PASS       "YOUR_PASSWORD"
 #define NODE_NAME       "apiary-ears"
-#define FW_VERSION      "1.5.0"
+#define FW_VERSION      "1.6.4"
 
 #define I2S_SD          4
 #define I2S_WS          5
@@ -128,6 +135,14 @@
 #define EVENT_ON_WINS   3
 #define EVENT_COOLDOWN_S 300
 
+// Optional AI. Wi-Fi credentials remain compile-time settings above; AI credentials
+// are entered later from the web page and kept in ESP32 NVS. Nothing here is a
+// shared project key, so the same firmware can be published and flashed by anyone.
+#define AI_HTTP_TIMEOUT_MS 60000
+#define AI_MAX_RESULT_CHARS 6000
+#define AI_OPENROUTER_MODEL "openrouter/free"
+#define AI_OPENAI_MODEL     "gpt-5.6-luna"
+
 // The bands, in Hz:
 //   60-180   fanning and general colony roar
 //   225-315  worker agitation and piping
@@ -146,6 +161,23 @@ const uint8_t bsecConfig[] = {
 // ----------------------------------------------------------------- globals --
 WebServer server(80);
 Bsec2     nose;
+Preferences aiPrefs;
+
+// AI configuration is deliberately separate from Wi-Fi configuration. The public
+// firmware never contains somebody else's key. Keys entered in the page are stored
+// in NVS and are never returned by the status API.
+SemaphoreHandle_t g_aiMutex = nullptr;
+String   g_aiProvider;                 // "openrouter" or "openai"
+String   g_aiKey;
+String   g_aiModel;
+String   g_aiLastResult;
+String   g_aiLastError;
+String   g_aiNotice;
+String   g_aiTask = "idle";
+String   g_aiLastAction;              // "test" or "analysis"
+volatile bool g_aiBusy = false;
+bool     g_aiLastOk = false;
+uint32_t g_aiLastEpoch = 0;
 
 float    g_band[BAND_COUNT], g_base[BAND_COUNT], g_dev[BAND_COUNT];
 bool     g_baseReady = false;
@@ -709,6 +741,517 @@ static void eventService() {
   }
 }
 
+// --------------------------------------------------------------------- AI ---
+// The ESP32 never makes autonomous hive-management decisions. AI is an optional,
+// on-demand second opinion over the sensor features this firmware already computes.
+// The prompt explicitly states that the score and fingerprint are experimental.
+
+static String jsonEscape(const String& in) {
+  String out;
+  out.reserve(in.length() + 32);
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '"':  out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if ((uint8_t)c >= 0x20) out += c;
+        else out += ' ';
+    }
+  }
+  return out;
+}
+
+static int hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+  if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+  return -1;
+}
+
+static void appendUtf8(String& out, uint16_t cp) {
+  if (cp < 0x80) out += (char)cp;
+  else if (cp < 0x800) {
+    out += (char)(0xC0 | (cp >> 6));
+    out += (char)(0x80 | (cp & 0x3F));
+  } else {
+    out += (char)(0xE0 | (cp >> 12));
+    out += (char)(0x80 | ((cp >> 6) & 0x3F));
+    out += (char)(0x80 | (cp & 0x3F));
+  }
+}
+
+// Extract a JSON string value without adding ArduinoJson as another required library.
+// This is enough for Chat Completions' choices[0].message.content and error.message.
+static bool jsonStringAfter(const String& body, const char* key, String& out, int startAt=0) {
+  int p = body.indexOf(key, startAt);
+  if (p < 0) return false;
+  p = body.indexOf(':', p + strlen(key));
+  if (p < 0) return false;
+  p++;
+  while (p < (int)body.length() && (body[p] == ' ' || body[p] == '\n' || body[p] == '\r' || body[p] == '\t')) p++;
+  if (p >= (int)body.length() || body[p] != '"') return false;
+  p++;
+  out = "";
+  out.reserve(min((int)body.length() - p, AI_MAX_RESULT_CHARS));
+  bool esc = false;
+  for (; p < (int)body.length() && out.length() < AI_MAX_RESULT_CHARS; p++) {
+    char c = body[p];
+    if (!esc) {
+      if (c == '\\') { esc = true; continue; }
+      if (c == '"') return true;
+      out += c;
+      continue;
+    }
+    esc = false;
+    switch (c) {
+      case 'n': out += '\n'; break;
+      case 'r': out += '\r'; break;
+      case 't': out += '\t'; break;
+      case 'b': out += '\b'; break;
+      case 'f': out += '\f'; break;
+      case '\\': out += '\\'; break;
+      case '"': out += '"'; break;
+      case '/': out += '/'; break;
+      case 'u': {
+        if (p + 4 < (int)body.length()) {
+          int a=hexNibble(body[p+1]), b=hexNibble(body[p+2]), d=hexNibble(body[p+3]), e=hexNibble(body[p+4]);
+          if (a>=0 && b>=0 && d>=0 && e>=0) {
+            appendUtf8(out, (uint16_t)((a<<12)|(b<<8)|(d<<4)|e));
+            p += 4;
+          } else out += '?';
+        } else out += '?';
+        break;
+      }
+      default: out += c; break;
+    }
+  }
+  return out.length() > 0;
+}
+
+// Extract assistant final text from the Chat Completions response. OpenRouter is
+// normally message.content as a string, but this also tolerates a content-parts
+// array/object with a nested "text" string. Reasoning fields are deliberately
+// ignored and are never displayed as the hive analysis.
+static bool extractAssistantText(const String& body, String& out) {
+  int choices = body.indexOf("\"choices\"");
+  int start = choices >= 0 ? choices : 0;
+  int message = body.indexOf("\"message\"", start);
+  if (message >= 0) start = message;
+  int content = body.indexOf("\"content\"", start);
+  if (content < 0) return false;
+
+  if (jsonStringAfter(body, "\"content\"", out, content) && out.length()) return true;
+
+  // Some OpenAI-compatible providers may return content parts instead of one string.
+  int finish = body.indexOf("\"finish_reason\"", content);
+  int textKey = body.indexOf("\"text\"", content);
+  if (textKey >= 0 && (finish < 0 || textKey < finish)) {
+    if (jsonStringAfter(body, "\"text\"", out, textKey) && out.length()) return true;
+  }
+  out = "";
+  return false;
+}
+
+static bool aiConfigured() {
+  return (g_aiProvider == "openrouter" || g_aiProvider == "openai") && g_aiKey.length() >= 8 && g_aiModel.length();
+}
+
+static String aiProviderLabel(const String& p) {
+  if (p == "openrouter") return "OpenRouter";
+  if (p == "openai") return "OpenAI API";
+  return "Not configured";
+}
+
+static String fMaybe(float v, unsigned int digits=1) {
+  return isnan(v) ? String("unknown") : String(v, digits);
+}
+
+static String buildHivePrompt() {
+  String p;
+  p.reserve(5200);
+  p += "Analyze this honey-bee hive sensor snapshot. This is Apiary Ears firmware, which combines microphone frequency-band features with a BME688 gas-resistance fingerprint. ";
+  p += "IMPORTANT: the firmware's acoustic score and band weights are experimental hypotheses, not validated swarm or disease predictors. Do not diagnose disease, queen status, swarming, poisoning, or colony failure as a fact. Use cautious language and suggest physical inspection when warranted.\n\n";
+  p += "CURRENT\n";
+  p += "score=" + String(g_score,1) + "/100; peak_since_boot=" + String(g_scorePeak,1) + "; baseline_ready=" + String(g_baseReady ? "yes" : "no") + "; in_event=" + String(g_inEvent ? "yes" : "no") + "\n";
+  p += "components: fanning=" + String(g_scComp[0],0) + ", agitation=" + String(g_scComp[1],0) + ", piping=" + String(g_scComp[2],0) + ", environment=" + String(g_scComp[3],0) + "\n";
+  p += "microphone_level_dbfs=" + String(g_dbfs,1) + "; clipping=" + String(g_clip ? "yes" : "no") + "\n";
+  p += "temperature_C=" + fMaybe(g_tempC) + "; humidity_pct=" + fMaybe(g_rh,0) + "; pressure_hPa=" + fMaybe(g_hpa,1) + "; temp_rate_C_per_h=" + String(g_tempRate,2) + "\n";
+  p += "BME688: available=" + String(g_noseOk ? "yes" : "no") + "; burst_position=" + String(g_nosePos) + "; mean_kOhm=" + fMaybe(g_noseMean,1) + "; baseline_kOhm=" + fMaybe(g_noseBase,1) + "; relative_gas_change=" + String(g_noseDev*100.0f,1) + "% more-gas direction\n";
+  p += "12 band deviations from this hive's rolling baseline (dB): ";
+  for (int b=0; b<BAND_COUNT; b++) {
+    if (b) p += ", ";
+    p += String(BAND_HZ[b],0) + "Hz=" + String(g_dev[b],1);
+  }
+  p += "\nlast 10-step gas fingerprint kOhm: ";
+  for (int k=0; k<NOSE_STEPS; k++) {
+    if (k) p += ", ";
+    p += String(HEATER_C[k]) + "C=" + fMaybe(g_specLast[k],1);
+  }
+  p += "\n\n";
+
+  uint16_t take = min<uint16_t>(60, g_minCount);
+  if (take) {
+    float scoreSum=0, scoreMax=0, tMin=999, tMax=-999, rhMin=999, rhMax=-999;
+    float noseMin=1e9, noseMax=0; uint16_t noseN=0;
+    for (uint16_t i=0; i<take; i++) {
+      const MinuteRow& r = g_min[(g_minHead + MINUTE_RING - take + i) % MINUTE_RING];
+      scoreSum += r.score; if (r.score > scoreMax) scoreMax = r.score;
+      float t = r.t10 / 10.0f; if (t < tMin) tMin=t; if (t > tMax) tMax=t;
+      if (r.rh < rhMin) rhMin=r.rh; if (r.rh > rhMax) rhMax=r.rh;
+      if (r.noseMean) { if (r.noseMean<noseMin) noseMin=r.noseMean; if (r.noseMean>noseMax) noseMax=r.noseMean; noseN++; }
+    }
+    p += "RECENT HISTORY (last " + String(take) + " minute summaries)\n";
+    p += "score_avg=" + String(scoreSum/take,1) + "; score_peak=" + String(scoreMax,0);
+    p += "; temp_range_C=" + String(tMin,1) + ".." + String(tMax,1);
+    p += "; humidity_range_pct=" + String(rhMin,0) + ".." + String(rhMax,0);
+    if (noseN) p += "; settled_gas_mean_range_kOhm=" + String(noseMin,0) + ".." + String(noseMax,0);
+    p += "\n\n";
+  }
+
+  uint8_t evTake = min<uint8_t>(5, g_evCount);
+  p += "RECENT BOARD-DETECTED EVENTS: " + String(g_evCount) + " retained";
+  if (!evTake) p += "; none yet.\n";
+  else {
+    p += "; newest " + String(evTake) + ":\n";
+    for (uint8_t n=0; n<evTake; n++) {
+      const Event& e = g_events[g_evCount - evTake + n];
+      p += "- peak=" + String(e.peak) + ", duration_s=" + String(e.durS) + ", components=" + String(e.comp[0]) + "/" + String(e.comp[1]) + "/" + String(e.comp[2]) + "/" + String(e.comp[3]);
+      if (e.note[0]) p += ", keeper_note=\"" + String(e.note) + "\"";
+      p += "\n";
+    }
+  }
+
+  p += "\nReturn a concise beekeeper-facing analysis with exactly these headings:\n";
+  p += "STATUS — NORMAL, WATCH, or CHECK SOON, with one sentence why.\n";
+  p += "WHAT STANDS OUT — 2-4 bullets grounded only in the supplied measurements.\n";
+  p += "POSSIBLE EXPLANATIONS — plausible alternatives, clearly labeled possibilities rather than diagnoses.\n";
+  p += "WHAT TO CHECK — practical non-destructive observations/inspection steps, highest priority first.\n";
+  p += "CONFIDENCE & LIMITS — low/medium/high confidence and what data is missing.\n";
+  p += "Do not recommend pesticide, medication, treatment, queen replacement, feeding, or opening the hive solely because an AI says so. Keep the whole response under 450 words.";
+  return p;
+}
+
+static String aiMemDiag() {
+  size_t freeHeap = ESP.getFreeHeap();
+  size_t largestInternal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  size_t freePsram = ESP.getFreePsram();
+  return "heap " + String((unsigned long)freeHeap) +
+         " B, internal " + String((unsigned long)freeInternal) +
+         " B, largest internal block " + String((unsigned long)largestInternal) +
+         " B, PSRAM " + String((unsigned long)freePsram) + " B";
+}
+
+static bool aiResolveHost(const String& provider, String& host, String& error) {
+  host = provider == "openrouter" ? "openrouter.ai" : "api.openai.com";
+  IPAddress ip;
+  if (!WiFi.hostByName(host.c_str(), ip)) {
+    error = "DNS lookup failed for " + host + ". RSSI " + String(WiFi.RSSI()) +
+            " dBm; " + aiMemDiag() + ".";
+    return false;
+  }
+  Serial.printf("[ai] DNS %s -> %s; %s\n", host.c_str(), ip.toString().c_str(), aiMemDiag().c_str());
+  return true;
+}
+
+static bool aiHttpCall(const String& provider, const String& key, const String& model,
+                       const String& prompt, String& answer, String& error) {
+  if (WiFi.status() != WL_CONNECTED) { error = "Wi-Fi is not connected."; return false; }
+  String url, host;
+  if (provider == "openrouter") url = "https://openrouter.ai/api/v1/chat/completions";
+  else if (provider == "openai") url = "https://api.openai.com/v1/chat/completions";
+  else { error = "Unknown AI provider."; return false; }
+  if (!aiResolveHost(provider, host, error)) return false;
+
+  const String system = "You are a careful assistant interpreting experimental honey-bee hive telemetry. Distinguish measured facts from hypotheses. Never present sensor patterns as a veterinary or apiary diagnosis. Return a final beekeeper-facing answer, not hidden reasoning.";
+  const uint8_t generationAttempts = provider == "openrouter" ? 2 : 1;
+  String lastRoutedModel, lastFinish;
+
+  for (uint8_t generationAttempt=1; generationAttempt<=generationAttempts; generationAttempt++) {
+    String body;
+    body.reserve(prompt.length() + 1100);
+    body = "{\"model\":\"" + jsonEscape(model) + "\",\"stream\":false,";
+    if (provider == "openrouter") {
+      // openrouter/free may select a reasoning model. Keep reasoning minimal and
+      // excluded so the output budget is reserved for the final hive report.
+      body += "\"max_tokens\":1800,\"reasoning\":{\"effort\":\"minimal\",\"exclude\":true},";
+    } else {
+      body += "\"max_completion_tokens\":1200,";
+    }
+    body += "\"messages\":[";
+    body += "{\"role\":\"system\",\"content\":\"" + jsonEscape(system) + "\"},";
+    body += "{\"role\":\"user\",\"content\":\"" + jsonEscape(prompt) + "\"}]}";
+
+    int code = -1;
+    String resp;
+    String transportError;
+    String tlsDetail;
+    for (uint8_t attempt=1; attempt<=2; attempt++) {
+      WiFiClientSecure requestTls;
+      requestTls.setInsecure();
+      requestTls.setHandshakeTimeout(30);
+      requestTls.setTimeout(AI_HTTP_TIMEOUT_MS);
+
+      HTTPClient http;
+      if (!http.begin(requestTls, url)) {
+        transportError = "Could not start HTTPS connection.";
+        code = -1;
+      } else {
+        http.setConnectTimeout(30000);
+        http.setTimeout(AI_HTTP_TIMEOUT_MS);
+        http.setReuse(false);
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("Authorization", "Bearer " + key);
+        if (provider == "openrouter") {
+          http.addHeader("X-Title", "Apiary Ears");
+          http.addHeader("HTTP-Referer", "https://github.com/");
+        }
+
+        Serial.printf("[ai] POST %s generation %u/%u transport %u/2 payload=%u bytes; %s; RSSI=%d dBm\n",
+                      host.c_str(), generationAttempt, generationAttempts, attempt,
+                      (unsigned)body.length(), aiMemDiag().c_str(), WiFi.RSSI());
+        code = http.POST(body);
+        if (code > 0) {
+          resp = http.getString();
+        } else {
+          transportError = HTTPClient::errorToString(code);
+          char tlsBuf[160] = {0};
+          int tlsCode = requestTls.lastError(tlsBuf, sizeof(tlsBuf));
+          if (tlsCode != 0) tlsDetail = "TLS " + String(tlsCode) + " (" + String(tlsBuf) + ")";
+        }
+        http.end();
+      }
+
+      if (code > 0) break;
+      Serial.printf("[ai] transport attempt %u failed: HTTP %d (%s) %s; %s; RSSI=%d dBm\n",
+                    attempt, code, transportError.c_str(), tlsDetail.c_str(), aiMemDiag().c_str(), WiFi.RSSI());
+      if (attempt < 2) { delay(900); yield(); }
+    }
+
+    if (code <= 0) {
+      if (!transportError.length()) transportError = "connection failed";
+      error = "HTTPS transport failed: " + String(code) + " (" + transportError + ")";
+      if (tlsDetail.length()) error += ". " + tlsDetail;
+      error += ". Host " + host + ", RSSI " + String(WiFi.RSSI()) + " dBm; " + aiMemDiag() + ".";
+      return false;
+    }
+    if (code < 200 || code >= 300) {
+      String msg;
+      if (!jsonStringAfter(resp, "\"message\"", msg)) msg = resp.substring(0, min((int)resp.length(), 500));
+      error = "HTTP " + String(code) + (msg.length() ? ": " + msg : "");
+      return false;
+    }
+
+    answer = "";
+    if (extractAssistantText(resp, answer) && answer.length()) {
+      if (answer.length() >= AI_MAX_RESULT_CHARS) answer += "\n[response truncated on device]";
+      return true;
+    }
+
+    lastRoutedModel = "";
+    lastFinish = "";
+    jsonStringAfter(resp, "\"model\"", lastRoutedModel);
+    jsonStringAfter(resp, "\"finish_reason\"", lastFinish);
+    Serial.printf("[ai] HTTP success but no final content; routed_model=%s finish_reason=%s response_bytes=%u\n",
+                  lastRoutedModel.c_str(), lastFinish.c_str(), (unsigned)resp.length());
+
+    // openrouter/free can route to different free models. If one returns no final
+    // content, make one fresh generation request rather than displaying reasoning.
+    if (provider == "openrouter" && generationAttempt < generationAttempts) {
+      delay(700);
+      yield();
+      continue;
+    }
+  }
+
+  error = "The provider returned success but no final text response";
+  if (lastRoutedModel.length()) error += " (model " + lastRoutedModel + ")";
+  if (lastFinish.length()) error += ", finish_reason=" + lastFinish;
+  error += ". OpenRouter was reached successfully; try Analyze Hive again or choose a specific model instead of openrouter/free.";
+  return false;
+}
+
+static bool aiTestConnection(const String& provider, const String& key, const String& model, String& error) {
+  if (WiFi.status() != WL_CONNECTED) { error = "Wi-Fi is not connected."; return false; }
+  String url, host;
+  if (provider == "openrouter") url = "https://openrouter.ai/api/v1/key";
+  else if (provider == "openai") url = "https://api.openai.com/v1/models/" + model;
+  else { error = "Unknown AI provider."; return false; }
+  if (!aiResolveHost(provider, host, error)) return false;
+
+  WiFiClientSecure tls;
+  tls.setInsecure();
+  tls.setHandshakeTimeout(30);
+  tls.setTimeout(AI_HTTP_TIMEOUT_MS);
+  HTTPClient http;
+  if (!http.begin(tls, url)) { error = "Could not start HTTPS connection to " + host + "."; return false; }
+  http.setConnectTimeout(30000);
+  http.setTimeout(AI_HTTP_TIMEOUT_MS);
+  http.setReuse(false);
+  http.addHeader("Authorization", "Bearer " + key);
+  if (provider == "openrouter") {
+    http.addHeader("X-Title", "Apiary Ears");
+    http.addHeader("HTTP-Referer", "https://github.com/");
+  }
+  Serial.printf("[ai] TEST %s; %s; RSSI=%d dBm\n", host.c_str(), aiMemDiag().c_str(), WiFi.RSSI());
+  int code = http.GET();
+  String resp = code > 0 ? http.getString() : String();
+  String transportError = code <= 0 ? HTTPClient::errorToString(code) : String();
+  char tlsBuf[160] = {0};
+  int tlsCode = code <= 0 ? tls.lastError(tlsBuf, sizeof(tlsBuf)) : 0;
+  http.end();
+  if (code >= 200 && code < 300) return true;
+  if (code <= 0) {
+    if (!transportError.length()) transportError = "connection failed";
+    error = "HTTPS transport failed: " + String(code) + " (" + transportError + ")";
+    if (tlsCode != 0) error += ". TLS " + String(tlsCode) + " (" + String(tlsBuf) + ")";
+    error += ". Host " + host + ", RSSI " + String(WiFi.RSSI()) + " dBm; " + aiMemDiag() + ".";
+    return false;
+  }
+  String msg;
+  if (!jsonStringAfter(resp, "\"message\"", msg)) msg = resp.substring(0, min((int)resp.length(), 500));
+  error = "HTTP " + String(code) + (msg.length() ? ": " + msg : "");
+  return false;
+}
+
+struct AiWork {
+  String provider, key, model, prompt;
+  bool test;
+};
+
+static void aiWorker(void* pv) {
+  AiWork* w = (AiWork*)pv;
+  String answer, error;
+  bool ok = w->test ? aiTestConnection(w->provider, w->key, w->model, error)
+                    : aiHttpCall(w->provider, w->key, w->model, w->prompt, answer, error);
+  if (g_aiMutex) xSemaphoreTake(g_aiMutex, portMAX_DELAY);
+  g_aiLastOk = ok;
+  g_aiLastError = ok ? "" : error;
+  g_aiLastAction = w->test ? "test" : "analysis";
+  if (w->test) {
+    g_aiNotice = ok ? "Connection test successful." : "Connection test failed.";
+  } else {
+    if (ok) {
+      g_aiLastResult = answer;
+      time_t tt = time(nullptr);
+      g_aiLastEpoch = (tt > 1600000000) ? (uint32_t)tt : (millis()/1000UL);
+      g_aiNotice = "Analysis complete.";
+    } else {
+      g_aiLastResult = "";
+      g_aiLastEpoch = 0;
+      g_aiNotice = "Analysis failed.";
+    }
+  }
+  g_aiTask = "idle";
+  g_aiBusy = false;
+  if (g_aiMutex) xSemaphoreGive(g_aiMutex);
+  delete w;
+  vTaskDelete(nullptr);
+}
+
+static bool aiStart(bool test, String& error) {
+  if (g_aiBusy) { error = "AI is already working."; return false; }
+  String provider, key, model;
+  if (g_aiMutex) xSemaphoreTake(g_aiMutex, portMAX_DELAY);
+  provider=g_aiProvider; key=g_aiKey; model=g_aiModel;
+  if (g_aiMutex) xSemaphoreGive(g_aiMutex);
+  if ((provider != "openrouter" && provider != "openai") || key.length() < 8 || !model.length()) {
+    error = "AI is not configured."; return false;
+  }
+  AiWork* w = new AiWork();
+  if (!w) { error = "Not enough memory to start AI task."; return false; }
+  w->provider=provider; w->key=key; w->model=model; w->test=test;
+  w->prompt = test ? "Reply with exactly: OK" : buildHivePrompt();
+
+  if (g_aiMutex) xSemaphoreTake(g_aiMutex, portMAX_DELAY);
+  g_aiBusy = true;
+  g_aiTask = test ? "test" : "analysis";
+  g_aiLastError = "";
+  g_aiLastAction = test ? "test" : "analysis";
+  if (!test) { g_aiLastResult = ""; g_aiLastEpoch = 0; }
+  g_aiNotice = test ? "Testing AI connection..." : "Analyzing current hive data...";
+  if (g_aiMutex) xSemaphoreGive(g_aiMutex);
+
+  BaseType_t made = xTaskCreate(aiWorker, "ai-http", 8192, w, 1, nullptr);
+  if (made != pdPASS) {
+    if (g_aiMutex) xSemaphoreTake(g_aiMutex, portMAX_DELAY);
+    g_aiBusy=false; g_aiTask="idle"; g_aiLastError="Could not create AI task.";
+    if (g_aiMutex) xSemaphoreGive(g_aiMutex);
+    delete w; error="Could not create AI task."; return false;
+  }
+  return true;
+}
+
+static void sendJsonCode(int code, const String& s) {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(code, "application/json", s);
+}
+
+static void handleAIStatus() {
+  String provider, model, result, err, notice, task, lastAction; bool busy, lastOk, configured; uint32_t ep;
+  if (g_aiMutex) xSemaphoreTake(g_aiMutex, portMAX_DELAY);
+  provider=g_aiProvider; model=g_aiModel; result=g_aiLastResult; err=g_aiLastError; notice=g_aiNotice; task=g_aiTask; lastAction=g_aiLastAction;
+  busy=g_aiBusy; lastOk=g_aiLastOk; ep=g_aiLastEpoch; configured=aiConfigured();
+  if (g_aiMutex) xSemaphoreGive(g_aiMutex);
+  String j="{\"ok\":true,\"configured\":" + String(configured?"true":"false") +
+           ",\"provider\":\"" + jsonEscape(provider) + "\",\"provider_label\":\"" + jsonEscape(aiProviderLabel(provider)) +
+           "\",\"model\":\"" + jsonEscape(model) + "\",\"busy\":" + String(busy?"true":"false") +
+           ",\"task\":\"" + jsonEscape(task) + "\",\"last_action\":\"" + jsonEscape(lastAction) + "\",\"last_ok\":" + String(lastOk?"true":"false") +
+           ",\"last_epoch\":" + String(ep) + ",\"notice\":\"" + jsonEscape(notice) +
+           "\",\"error\":\"" + jsonEscape(err) + "\",\"result\":\"" + jsonEscape(result) + "\"}";
+  sendJsonCode(200,j);
+}
+
+static void handleAIConfig() {
+  if (g_aiBusy) { sendJsonCode(409,"{\"ok\":false,\"error\":\"AI is busy; try again when it finishes.\"}"); return; }
+  String provider=server.arg("provider"), key=server.arg("key"), model=server.arg("model");
+  provider.trim(); key.trim(); model.trim();
+  if (provider != "openrouter" && provider != "openai") {
+    sendJsonCode(400,"{\"ok\":false,\"error\":\"Choose OpenRouter or OpenAI.\"}"); return;
+  }
+  if (!model.length()) model = provider=="openrouter" ? AI_OPENROUTER_MODEL : AI_OPENAI_MODEL;
+  if (model.length() > 120 || key.length() > 300) {
+    sendJsonCode(400,"{\"ok\":false,\"error\":\"AI model or key is too long.\"}"); return;
+  }
+  if (g_aiMutex) xSemaphoreTake(g_aiMutex, portMAX_DELAY);
+  if (!key.length() && provider == g_aiProvider && g_aiKey.length()) key = g_aiKey; // edit model without re-entering secret
+  if (key.length() < 8) {
+    if (g_aiMutex) xSemaphoreGive(g_aiMutex);
+    sendJsonCode(400,"{\"ok\":false,\"error\":\"Paste an API key first.\"}"); return;
+  }
+  g_aiProvider=provider; g_aiKey=key; g_aiModel=model;
+  g_aiLastResult=""; g_aiLastEpoch=0; g_aiLastError=""; g_aiLastOk=false; g_aiLastAction="";
+  g_aiNotice="Saved. Test the connection.";
+  aiPrefs.putString("provider",g_aiProvider); aiPrefs.putString("key",g_aiKey); aiPrefs.putString("model",g_aiModel);
+  if (g_aiMutex) xSemaphoreGive(g_aiMutex);
+  sendJsonCode(200,"{\"ok\":true}");
+}
+
+static void handleAIDelete() {
+  if (g_aiBusy) { sendJsonCode(409,"{\"ok\":false,\"error\":\"AI is busy; wait for it to finish first.\"}"); return; }
+  if (g_aiMutex) xSemaphoreTake(g_aiMutex, portMAX_DELAY);
+  g_aiProvider=""; g_aiKey=""; g_aiModel=""; g_aiLastResult=""; g_aiLastError=""; g_aiNotice="AI connection deleted."; g_aiLastAction=""; g_aiLastEpoch=0; g_aiLastOk=false;
+  aiPrefs.clear();
+  if (g_aiMutex) xSemaphoreGive(g_aiMutex);
+  sendJsonCode(200,"{\"ok\":true}");
+}
+
+static void handleAITest() {
+  String err;
+  if (!aiStart(true,err)) { sendJsonCode(g_aiBusy?409:400,"{\"ok\":false,\"error\":\""+jsonEscape(err)+"\"}"); return; }
+  sendJsonCode(202,"{\"ok\":true,\"started\":true}");
+}
+
+static void handleAIAnalyze() {
+  String err;
+  if (!aiStart(false,err)) { sendJsonCode(g_aiBusy?409:400,"{\"ok\":false,\"error\":\""+jsonEscape(err)+"\"}"); return; }
+  sendJsonCode(202,"{\"ok\":true,\"started\":true}");
+}
+
 // -------------------------------------------------------------------- web ---
 static void sendJson(const String& s) {
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -1089,8 +1632,17 @@ h1{color:var(--honey);font-size:22px;margin:6px 0 2px}
 h2{color:var(--honey);font-size:12px;letter-spacing:.08em;text-transform:uppercase;margin:0 0 8px}
 .sub{color:var(--mut);font-size:12px}
 .card{background:var(--pan);border:1px solid var(--edge);border-radius:12px;padding:13px 15px;margin-top:12px}
-button,input{background:transparent;color:var(--honey);border:1px solid var(--edge);border-radius:999px;padding:6px 13px;margin:0 6px 6px 0;font-size:12px;font-family:inherit;cursor:pointer}
-input{border-radius:8px;color:var(--cream);cursor:text}
+button,input,select,textarea{background:transparent;color:var(--honey);border:1px solid var(--edge);border-radius:999px;padding:6px 13px;margin:0 6px 6px 0;font-size:12px;font-family:inherit;cursor:pointer}
+input,select,textarea{border-radius:8px;color:var(--cream);cursor:text}
+select option{background:var(--pan);color:var(--cream)}
+.topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.aiout{white-space:pre-wrap;background:rgba(0,0,0,.28);border:1px solid var(--edge);border-radius:10px;padding:11px;margin-top:10px;min-height:50px;color:var(--cream)}
+.modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:20;padding:18px;overflow:auto}
+.modal.show{display:flex;align-items:center;justify-content:center}
+.modalbox{width:min(620px,100%);background:var(--pan);border:1px solid var(--edge);border-radius:14px;padding:16px 18px;box-shadow:0 20px 60px rgba(0,0,0,.55)}
+.modalbox label{display:block;color:var(--mut);font-size:11px;margin:10px 0 4px}
+.modalbox input,.modalbox select{width:100%;padding:9px 10px;margin:0}
+.warn{border-left:3px solid var(--honey);padding-left:9px}
 button.on{background:var(--honey);color:var(--bg);font-weight:600}
 .big{font-size:46px;font-weight:700;line-height:1}
 .row{display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end}
@@ -1107,8 +1659,10 @@ th{color:var(--mut);font-weight:500}
 .note{color:var(--mut);font-size:12px;margin-top:8px}
 a{color:var(--honey)}
 </style></head><body>
-<h1>Apiary Ears</h1>
-<div class="sub" id="hdr">connecting…</div>
+<div class="topbar">
+  <div><h1>Apiary Ears</h1><div class="sub" id="hdr">connecting…</div></div>
+  <button onclick="openAI()" title="Configure optional AI hive analysis">✦ Configure AI</button>
+</div>
 
 <div class="card">
   <div class="row">
@@ -1120,6 +1674,19 @@ a{color:var(--honey)}
     <div><div class="sub">level</div><div id="dbfs" class="sub">–</div><div class="sub" id="evstate"></div></div>
   </div>
   <div class="note" id="baseNote"></div>
+</div>
+
+<div class="card">
+  <div style="display:flex;justify-content:space-between;gap:10px;align-items:center">
+    <h2 style="margin:0">AI hive analysis</h2><span class="tag" id="aiBadge">not configured</span>
+  </div>
+  <div class="sub" id="aiInfo" style="margin:7px 0 9px">Optional. Your sensor features stay local until you press Analyze Hive.</div>
+  <button id="aiAnalyzeBtn" onclick="aiAnalyze()">✦ Analyze hive</button>
+  <button onclick="openAI()">⚙ Configure AI</button>
+  <button id="aiTestBtn" onclick="aiTest()">↻ Test / reconnect</button>
+  <div class="note" id="aiWork"></div>
+  <div class="aiout" id="aiResult">No AI analysis yet.</div>
+  <div class="note">Only the numeric sensor summary, recent minute statistics and event summaries are sent. Audio recordings are not uploaded.</div>
 </div>
 
 <div class="card">
@@ -1201,6 +1768,33 @@ a{color:var(--honey)}
   <div class="note">Minute-by-minute bands, scores, smell and conditions, plus every event — the format the shared dataset uses.</div>
 </div>
 
+<div id="aiModal" class="modal" onclick="if(event.target===this)closeAI()">
+  <div class="modalbox">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px">
+      <h1 style="font-size:18px;margin:0">Configure AI</h1><button onclick="closeAI()">✕</button>
+    </div>
+    <div class="note">Wi-Fi stays configured in the .ino exactly as before. This only adds optional AI credentials after flashing.</div>
+    <label>Provider</label>
+    <select id="aiProvider" onchange="aiProviderChanged(true)">
+      <option value="openrouter">OpenRouter — recommended / free-model option</option>
+      <option value="openai">OpenAI API — advanced / paid API</option>
+    </select>
+    <div class="note warn" id="aiHelp"></div>
+    <label>API key</label>
+    <input id="aiKey" type="password" autocomplete="off" placeholder="paste key here">
+    <div class="note">The key is stored in this ESP32's NVS and is never shown back in the page. If already configured, leave this blank to keep the existing key.</div>
+    <label>Model</label>
+    <input id="aiModel" maxlength="120" placeholder="model name">
+    <div style="margin-top:14px">
+      <button class="on" onclick="aiSave()" id="aiSaveBtn">Save & test connection</button>
+      <button onclick="closeAI()">Cancel</button>
+      <button id="aiDeleteBtn" onclick="aiDelete()" style="border-color:rgba(224,78,58,.5);color:#e04e3a">Delete AI connection</button>
+    </div>
+    <div class="note" id="aiCfgMsg"></div>
+    <div class="note">Security: configure keys only on a trusted private Wi-Fi network. This page itself is HTTP, and the key is stored locally in flash/NVS.</div>
+  </div>
+</div>
+
 <div class="sub" style="margin:18px 0 30px">
   The score is a hypothesis, not a prediction. Sound moves in minutes and smell over hours, so a
   spike with no change in the fingerprint is probably weather or machinery, while both moving together
@@ -1208,7 +1802,7 @@ a{color:var(--honey)}
 </div>
 
 <script>
-let MIN=1440, N=null, H=null;
+let MIN=1440, N=null, H=null, AI=null;
 const el=i=>document.getElementById(i);
 const WINS=[[60,'1 h'],[180,'3 h'],[720,'12 h'],[1440,'24 h']];
 function sc(v){return v>=70?'#e04e3a':v>=45?'#e8b923':'#5fd39a'}
@@ -1467,11 +2061,92 @@ async function record(){
   el('recMsg').textContent = r.ok ? `Recording ${r.seconds} s…` : (r.error||'could not start');
   setTimeout(()=>{ el('recMsg').innerHTML='Done — <a href="/clip.wav">download the clip</a>.'; }, 11000);
 }
+function aiProviderChanged(forceModel=false){
+  const p=el('aiProvider').value;
+  if(forceModel || !el('aiModel').value.trim()) el('aiModel').value=p==='openrouter'?'openrouter/free':'gpt-5.6-luna';
+  el('aiHelp').innerHTML = p==='openrouter'
+    ? 'Recommended for the public project. <a href="https://openrouter.ai/settings/keys" target="_blank" rel="noopener">Sign in to OpenRouter and create/copy a key</a>, then paste it below. The default <b>openrouter/free</b> router chooses an available free model.'
+    : 'Advanced option. <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">Create/copy an OpenAI API key</a>. ChatGPT subscriptions and API billing are separate. The low-cost default here is <b>gpt-5.6-luna</b>.';
+}
+function openAI(){
+  const p=(AI&&AI.provider)||'openrouter';
+  el('aiProvider').value=p;
+  el('aiModel').value=(AI&&AI.model)||(p==='openrouter'?'openrouter/free':'gpt-5.6-luna');
+  el('aiKey').value=''; el('aiCfgMsg').textContent='';
+  el('aiDeleteBtn').style.display=(AI&&AI.configured)?'inline-block':'none';
+  aiProviderChanged(false); el('aiModal').classList.add('show');
+}
+function closeAI(){ el('aiModal').classList.remove('show'); }
+async function loadAI(){
+  try{ AI=await (await fetch('/api/ai/status',{cache:'no-store'})).json(); }catch(e){ return; }
+  const on=!!AI.configured;
+  const aiErr=on && !AI.busy && !!AI.error;
+  const connErr=aiErr && AI.last_action==='test';
+  const analysisErr=aiErr && AI.last_action==='analysis';
+  el('aiBadge').textContent=!on?'not configured':(AI.busy?'working…':(connErr?'connection error':(analysisErr?'analysis error':(AI.last_ok?'connected':'configured'))));
+  el('aiBadge').style.background=!on?'rgba(232,185,35,.2)':(aiErr?'rgba(224,78,58,.18)':'rgba(95,211,154,.18)');
+  el('aiBadge').style.color=!on?'#e8b923':(aiErr?'#e04e3a':'#5fd39a');
+  el('aiInfo').textContent=on?`${AI.provider_label} · ${AI.model}`:'Optional. Configure a provider once, then press Analyze Hive whenever you want a second opinion.';
+  el('aiAnalyzeBtn').style.display=on?'inline-block':'none';
+  el('aiTestBtn').style.display=on?'inline-block':'none';
+  el('aiAnalyzeBtn').disabled=!!AI.busy; el('aiTestBtn').disabled=!!AI.busy;
+  let m=AI.notice||''; if(AI.error) m+=(m?' ':'')+'Error: '+AI.error;
+  el('aiWork').textContent=m;
+  if(AI.busy && AI.task==='analysis') el('aiResult').textContent='Analyzing current hive data…';
+  else if(AI.result) el('aiResult').textContent=AI.result;
+  else if(!on) el('aiResult').textContent='Configure AI to enable on-demand hive analysis.';
+  else if(!AI.busy && AI.error && AI.last_action==='analysis') el('aiResult').textContent='This analysis failed. No previous AI result is being shown.\n\n'+AI.error;
+  else if(!AI.busy && AI.error) el('aiResult').textContent='AI connection needs attention. Press Test / reconnect.\n\n'+AI.error;
+  else if(!AI.busy) el('aiResult').textContent=(AI.last_ok?'Connected. ':'Configured. ')+'Press Analyze Hive when you want an AI interpretation of the current sensor data.';
+}
+async function aiSave(){
+  const b=el('aiSaveBtn'); b.disabled=true; el('aiCfgMsg').textContent='Saving…';
+  const body=new URLSearchParams({provider:el('aiProvider').value,key:el('aiKey').value.trim(),model:el('aiModel').value.trim()});
+  try{
+    const r=await fetch('/api/ai/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
+    const j=await r.json();
+    if(!r.ok||!j.ok){ el('aiCfgMsg').textContent=j.error||'Could not save AI settings.'; b.disabled=false; return; }
+    await loadAI(); el('aiCfgMsg').textContent='Saved. Testing connection…'; closeAI(); await aiTest();
+  }catch(e){ el('aiCfgMsg').textContent='Could not reach the node.'; }
+  b.disabled=false;
+}
+async function aiPoll(){
+  for(let i=0;i<70;i++){
+    await new Promise(r=>setTimeout(r,1000)); await loadAI();
+    if(AI && !AI.busy) return;
+  }
+  el('aiWork').textContent='The AI request is taking longer than expected. You can refresh this page and check again.';
+}
+async function aiTest(){
+  el('aiWork').textContent='Starting connection test…';
+  try{
+    const r=await fetch('/api/ai/test',{method:'POST'}), j=await r.json();
+    if(!r.ok||!j.ok){ el('aiWork').textContent=j.error||'Could not start test.'; return; }
+    await loadAI(); aiPoll();
+  }catch(e){ el('aiWork').textContent='Could not reach the node.'; }
+}
+async function aiAnalyze(){
+  if(!AI||!AI.configured){ openAI(); return; }
+  el('aiResult').textContent='Analyzing current hive data…';
+  try{
+    const r=await fetch('/api/ai/analyze',{method:'POST'}), j=await r.json();
+    if(!r.ok||!j.ok){ el('aiWork').textContent=j.error||'Could not start analysis.'; return; }
+    await loadAI(); aiPoll();
+  }catch(e){ el('aiWork').textContent='Could not reach the node.'; }
+}
+async function aiDelete(){
+  if(!confirm('Delete the AI connection and stored API key from this ESP32?')) return;
+  try{
+    const r=await fetch('/api/ai/delete',{method:'POST'}), j=await r.json();
+    if(!r.ok||!j.ok){ el('aiCfgMsg').textContent=j.error||'Could not delete AI settings.'; return; }
+    closeAI(); await loadAI();
+  }catch(e){ el('aiCfgMsg').textContent='Could not reach the node.'; }
+}
 function exportJson(){
   const l=el('xpLabel').value.trim(); if(!l){ alert('Give the export a label first.'); return; }
   window.location=`/api/export?label=${encodeURIComponent(l)}&minutes=${el('xpMins').value}`;
 }
-tick(); loadHist(); loadEvents(); loadNose(); loadClips(); loadNode();
+tick(); loadHist(); loadEvents(); loadNose(); loadClips(); loadNode(); loadAI();
 setInterval(tick,2000); setInterval(loadHist,60000); setInterval(loadEvents,30000);
 setInterval(loadNose,20000); setInterval(loadClips,30000);
 </script></body></html>)HTML";
@@ -1483,6 +2158,15 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.printf("\n=== %s fw %s ===\n", NODE_NAME, FW_VERSION);
+
+  g_aiMutex = xSemaphoreCreateMutex();
+  aiPrefs.begin("apiary-ai", false);
+  g_aiProvider = aiPrefs.getString("provider", "");
+  g_aiKey      = aiPrefs.getString("key", "");
+  g_aiModel    = aiPrefs.getString("model", "");
+  if (g_aiProvider == "openrouter" && !g_aiModel.length()) g_aiModel = AI_OPENROUTER_MODEL;
+  if (g_aiProvider == "openai" && !g_aiModel.length()) g_aiModel = AI_OPENAI_MODEL;
+  Serial.printf("[ai] %s%s\n", aiConfigured() ? "configured: " : "not configured", aiConfigured() ? aiProviderLabel(g_aiProvider).c_str() : "");
 
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(NODE_NAME);
@@ -1534,6 +2218,11 @@ void setup() {
   server.on("/api/node", handleNode);
   server.on("/api/selfcheck", handleSelfCheck);
   server.on("/api/restart", handleRestart);
+  server.on("/api/ai/status", HTTP_GET, handleAIStatus);
+  server.on("/api/ai/config", HTTP_POST, handleAIConfig);
+  server.on("/api/ai/delete", HTTP_POST, handleAIDelete);
+  server.on("/api/ai/test", HTTP_POST, handleAITest);
+  server.on("/api/ai/analyze", HTTP_POST, handleAIAnalyze);
   server.begin();
   Serial.println("[http] listening on :80");
   Serial.println("[note] the score needs a minute to learn this hive's baseline before it means anything.");

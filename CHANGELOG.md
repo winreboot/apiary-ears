@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.6.4 — 2026-09-15
+
+- Optional AI hive analysis: **Analyze hive** button and a Configure AI dialog on the page.
+  Providers: OpenRouter (default model `openrouter/free`) or the OpenAI API (default
+  `gpt-5.6-luna`). Bring your own key; it is stored in NVS, never returned by the API, never
+  exported. New endpoints `/api/ai/status|config|test|analyze|delete`. Requests run in their
+  own FreeRTOS task with a 60 s timeout and a 6000-character result cap.
+- The prompt sends numbers only (score, components, band deviations, gas fingerprint, 60-minute
+  summary, newest five events with keeper notes) and instructs the model to treat the score as
+  a hypothesis and to avoid diagnoses. Documented in docs/AI-ANALYSIS.md.
+- 1.6.4 specifically: compatibility with OpenRouter's free router when it selects a reasoning
+  model — reasoning is requested at minimal effort and excluded from the reply, content parts
+  are accepted as well as a single string, and a reply with no final text is retried once.
+- TLS to the provider is not certificate-verified in this version (documented).
+
 Versions are the `FW_VERSION` in `firmware/apiary_ears/apiary_ears.ino`.
 
 ## 1.5.0 — 2026-09-15
