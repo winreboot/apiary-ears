@@ -80,7 +80,7 @@
  *  microphone draw in bursts, and a rail that reads 3.30 V but dips to 2.95 V
  *  during a pulse is what resets sensors on a long cable. The page shows both.
  *
- *  v1.3.0
+ *  v1.3.1
  * =============================================================================
  */
 
@@ -97,7 +97,7 @@
 #define WIFI_SSID       "YOUR_WIFI"
 #define WIFI_PASS       "YOUR_PASSWORD"
 #define NODE_NAME       "apiary-ears"
-#define FW_VERSION      "1.3.0"
+#define FW_VERSION      "1.3.1"
 
 #define I2S_SD          4
 #define I2S_WS          5
@@ -1322,7 +1322,8 @@ function railClass(v, nominal){
   return ['#e04e3a', v<4.5?'too low':'too high'];
 }
 function railChip(label, r, nominal){
-  if(!r || !r.fitted) return `<span class="sub" style="margin-right:12px">${label}: not wired</span>`;
+  if(!r || !r.fitted)
+    return `<span class="sub" style="margin-right:14px">${label} rail monitor: not fitted <i>(optional)</i></span>`;
   const [c, word] = railClass(r.now, nominal);
   const [cm]      = railClass(r.min, nominal);
   const sag = (r.min!=null && r.now!=null && (r.now - r.min) >= 0.05)
@@ -1366,8 +1367,9 @@ async function loadNode(){
   const V=N2.volts||{};
   el('rails').innerHTML = railChip('3.3 V', V.v33, 3.3) + railChip('5 V', V.v5, 5.0)
     + ((V.v33 && V.v33.fitted) ? '' :
-       '<div class="sub" style="margin-top:4px">Two resistors add a rail monitor \u2014 see docs/WIRING.md. '
-       + 'Worth it on a long cable: a rail that reads fine but dips during a heater pulse is what resets sensors.</div>');
+       '<div class="sub" style="margin-top:4px">This is about measuring the supply, not powering the sensors \u2014 '
+       + 'an ESP32 cannot read its own rail. Two resistors and one <code>#define</code> add it: see docs/WIRING.md. '
+       + 'Worth fitting on a long cable, where a rail that reads fine but dips during a heater pulse is what resets a sensor.</div>');
   const st=N2.storage||{};
   el('nodeDetail').innerHTML =
     (N2.inputs||[]).map(i=>

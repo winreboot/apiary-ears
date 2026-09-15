@@ -2,6 +2,16 @@
 
 Versions are the `FW_VERSION` in `firmware/apiary_ears/apiary_ears.ino`.
 
+## 1.3.1 — 2026-09-14
+
+**Wording fix: "not wired" read as a complaint about the sensor.**
+
+The Node panel said "3.3 V: not wired" when no rail monitor was fitted, which looks like it
+is reporting that something is unpowered — confusing when your BME688 is plainly connected
+to 3.3 V and working. It now says "3.3 V rail monitor: not fitted (optional)", and the note
+underneath explains the distinction: an ESP32 cannot read its own supply, so measuring the
+rail needs two resistors and one `#define`. Nothing about the sensors changed.
+
 ## 1.3.0 — 2026-09-14
 
 **Fix things without walking back to the computer.**
