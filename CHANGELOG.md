@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.7.0 — 2026-09-15
+
+Page only, plus one small history addition in the firmware.
+
+- **Sound — twelve bands** is now an equaliser: LED-segmented bars, colour still by
+  deviation from this hive's baseline. Each band carries a bright **peak-hold tick** that
+  holds for 8 s, then sinks toward the live level and fades over ~45 s until a new high sets
+  it again, and a dashed **10-minute average** tick from the history ring. The bar scale
+  relaxes slowly instead of rescaling every poll, so peaks stay comparable.
+- **Sound over time**: a 12-row heatmap under the bands (one column per minute, the same
+  window as the score chart) — the acoustic twin of the smell fingerprint map.
+- **Score components** (fanning · agitation · piping · environment): the live fill is
+  unchanged; a bright tick marks the 10-minute average and a faint tick the selected
+  window's average, with the averages in the labels.
+- **Smell — ten heater steps**: the same equaliser treatment with a slow peak-hold
+  (2 min hold, ~20 min fade), so the highest recent reading per step stays visible
+  between scans.
+- Firmware: each minute-row now stores the average of the four score components
+  (`MinuteRow.comp`, +4 bytes per row); `/api/history` returns them as `"c":[…]`. No
+  other API change.
+
+## 1.6.4 — 2026-09-15
+
+- Optional AI hive analysis: **Analyze hive** button and a Configure AI dialog on the page.
+  Providers: OpenRouter (default model `openrouter/free`) or the OpenAI API (default
+  `gpt-5.6-luna`). Bring your own key; it is stored in NVS, never returned by the API, never
+  exported. New endpoints `/api/ai/status|config|test|analyze|delete`. Requests run in their
+  own FreeRTOS task with a 60 s timeout and a 6000-character result cap.
+- The prompt sends numbers only (score, components, band deviations, gas fingerprint, 60-minute
+  summary, newest five events with keeper notes) and instructs the model to treat the score as
+  a hypothesis and to avoid diagnoses. Documented in docs/AI-ANALYSIS.md.
+- 1.6.4 specifically: compatibility with OpenRouter's free router when it selects a reasoning
+  model — reasoning is requested at minimal effort and excluded from the reply, content parts
+  are accepted as well as a single string, and a reply with no final text is retried once.
+- TLS to the provider is not certificate-verified in this version (documented).
+
 ## 1.6.4 — 2026-09-15
 
 - Optional AI hive analysis: **Analyze hive** button and a Configure AI dialog on the page.

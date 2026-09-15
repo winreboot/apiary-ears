@@ -83,6 +83,9 @@
  *  raw per-scan view still shows everything, because that is what raw means.
  *
  *  v1.6.4 — OpenRouter free-router reasoning/content compatibility
+ *  v1.7.0 — page: equaliser bars with peak-hold ticks that fade, average ticks
+ *           on the score components, sound-over-time heatmap; per-minute
+ *           component averages kept in the history ring (/api/history "c")
  * =============================================================================
  */
 
@@ -106,7 +109,7 @@
 #define WIFI_SSID       "YOUR_WIFI"
 #define WIFI_PASS       "YOUR_PASSWORD"
 #define NODE_NAME       "apiary-ears"
-#define FW_VERSION      "1.6.4"
+#define FW_VERSION      "1.7.0"
 
 #define I2S_SD          4
 #define I2S_WS          5
@@ -229,6 +232,7 @@ struct MinuteRow {
   uint32_t epoch;
   uint8_t  band[BAND_COUNT];
   uint8_t  score;
+  uint8_t  comp[4];                    // minute-average of the four score components
   uint16_t noseMean;                   // kOhm, clipped to 65535
   int16_t  t10;                          // tenths of a degree C; whole degrees made a
                                          // gently drifting room look like a square wave
@@ -238,6 +242,7 @@ MinuteRow g_min[MINUTE_RING];
 uint16_t  g_minHead = 0, g_minCount = 0;
 uint32_t  g_minAccN = 0;
 float     g_minAcc[BAND_COUNT], g_minScorePeak = 0;
+float     g_minCompAcc[4] = {0, 0, 0, 0};
 // Post-rest scans read several times high, so a minute that happens to end on one
 // would spike. Average the settled scans instead of sampling whatever was last.
 double    g_minNoseAcc = 0;
@@ -365,6 +370,7 @@ static void scoreWindow() {
   if (g_score > g_scorePeak) g_scorePeak = g_score;
 
   for (int b = 0; b < BAND_COUNT; b++) g_minAcc[b] += g_band[b];
+  for (int i = 0; i < 4; i++) g_minCompAcc[i] += g_scComp[i];
   if (g_score > g_minScorePeak) g_minScorePeak = g_score;
   g_minAccN++;
 }
@@ -377,6 +383,7 @@ static void minuteRoll() {
   for (int b = 0; b < BAND_COUNT; b++)
     r.band[b] = (uint8_t)fminf(fmaxf((g_minAcc[b] / g_minAccN) * 1.8f, 0.0f), 255.0f);
   r.score = (uint8_t)fminf(g_minScorePeak, 255.0f);
+  for (int i = 0; i < 4; i++) r.comp[i] = (uint8_t)fminf(fmaxf(g_minCompAcc[i] / g_minAccN, 0.0f), 255.0f);
   r.noseMean = g_minNoseN ? (uint16_t)fminf((float)(g_minNoseAcc / g_minNoseN), 65535.0f)
                           : (isnan(g_noseMean) ? 0 : (uint16_t)fminf(g_noseMean, 65535.0f));
   r.t10 = isnan(g_tempC) ? -990 : (int16_t)roundf(g_tempC * 10.0f);
@@ -384,6 +391,7 @@ static void minuteRoll() {
   g_minHead = (g_minHead + 1) % MINUTE_RING;
   if (g_minCount < MINUTE_RING) g_minCount++;
   for (int b = 0; b < BAND_COUNT; b++) g_minAcc[b] = 0;
+  for (int i = 0; i < 4; i++) g_minCompAcc[i] = 0;
   g_minAccN = 0; g_minScorePeak = 0;
   g_minNoseAcc = 0; g_minNoseN = 0;
   g_minStartMs = millis();
@@ -1309,6 +1317,8 @@ static void handleHistory() {
          ",\"nose\":" + String(r.noseMean) + ",\"t\":" + String(r.t10 / 10.0f, 1) +
          ",\"rh\":" + String(r.rh) + ",\"b\":[";
     for (int b = 0; b < BAND_COUNT; b++) { if (b) j += ','; j += String(r.band[b]); }
+    j += "],\"c\":[";
+    for (int i = 0; i < 4; i++) { if (i) j += ','; j += String(r.comp[i]); }
     j += "]}";
   }
   j += "]}";
@@ -1646,8 +1656,16 @@ select option{background:var(--pan);color:var(--cream)}
 button.on{background:var(--honey);color:var(--bg);font-weight:600}
 .big{font-size:46px;font-weight:700;line-height:1}
 .row{display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end}
-.meter{height:9px;background:rgba(255,255,255,.08);border-radius:5px;overflow:hidden;margin-top:5px}
-.meter i{display:block;height:100%;background:var(--honey);transition:width .3s}
+.meter{height:9px;background:rgba(255,255,255,.08);border-radius:5px;overflow:visible;margin-top:5px;position:relative}
+.meter i{display:block;height:100%;background:var(--honey);transition:width .3s;border-radius:5px}
+.meter .t{position:absolute;top:-3px;width:2px;height:15px;background:var(--cream);border-radius:1px;transition:left .6s}
+.meter .t.w{height:11px;top:-1px;background:rgba(233,220,195,.4)}
+.eq{display:flex;gap:3px;height:90px;align-items:flex-end;position:relative}
+.eq .b{flex:1;position:relative;height:100%}
+.eq .f{position:absolute;left:0;right:0;bottom:0;min-height:2px;border-radius:3px 3px 0 0;transition:height .25s,background-color .4s;background-image:repeating-linear-gradient(to top,transparent 0 5px,var(--bg) 5px 7px)}
+.eq .p{position:absolute;left:0;right:0;height:2px;background:var(--cream);border-radius:1px;pointer-events:none}
+.eq .a{position:absolute;left:12%;right:12%;height:0;border-top:1px dashed rgba(233,220,195,.5);pointer-events:none;transition:bottom .6s}
+.eq .g{position:absolute;left:0;right:0;bottom:0;top:0;border-radius:3px 3px 0 0;background:rgba(255,255,255,.035)}
 .bars{display:flex;gap:3px;align-items:flex-end;height:90px}
 .bars i{flex:1;border-radius:3px 3px 0 0;min-height:2px;transition:height .25s}
 canvas{width:100%;border:1px solid var(--edge);border-radius:10px;background:rgba(0,0,0,.3);display:block}
@@ -1668,7 +1686,7 @@ a{color:var(--honey)}
   <div class="row">
     <div><div class="sub">Score now</div><div class="big" id="score">–</div></div>
     <div style="flex:1;min-width:230px">
-      <div class="sub">fanning · agitation · piping · environment</div>
+      <div class="sub">fanning · agitation · piping · environment <span style="opacity:.7">· live fill, bright tick = 10-min average, faint tick = window average</span></div>
       <div id="comps"></div>
     </div>
     <div><div class="sub">level</div><div id="dbfs" class="sub">–</div><div class="sub" id="evstate"></div></div>
@@ -1691,14 +1709,16 @@ a{color:var(--honey)}
 
 <div class="card">
   <h2>Sound — twelve bands</h2>
-  <div class="bars" id="bars"></div>
+  <div class="eq" id="bars"></div>
   <div class="lab" id="bandLab"></div>
-  <div class="note">Bars turn honey then red as a band rises above this hive's own baseline. The absolute height means little; the colour means something.</div>
+  <div class="note">Bars turn honey then red as a band rises above this hive's own baseline. The absolute height means little; the colour means something. The bright tick is the recent peak — it holds, then sinks and fades until a new high sets it again. The dashed tick is the last ten minutes' average.</div>
+  <canvas id="bandHist" width="840" height="120" style="margin-top:10px"></canvas>
+  <div class="lab"><span id="bandFrom"></span><span>rows = bands, low at the top · brighter = louder in that band</span><span>now</span></div>
 </div>
 
 <div class="card">
   <h2>Smell — the ten heater steps</h2>
-  <div class="bars" id="nose" style="height:60px"></div>
+  <div class="eq" id="nose" style="height:60px"></div>
   <div class="lab" id="noseLab"></div>
   <div class="note" id="noseMsg"></div>
 </div>
@@ -1803,6 +1823,25 @@ a{color:var(--honey)}
 
 <script>
 let MIN=1440, N=null, H=null, AI=null;
+// Peak-hold state for the equalisers. Each entry: cur (live fraction), pk (peak fraction), t (ms when peak was set).
+const EQ={bars:{s:[],mx:0,hold:8000,fade:45000,sink:.06},nose:{s:[],mx:0,hold:120000,fade:1200000,sink:.02}};
+function eqBuild(id,n){ const e=el(id); if(e.children.length===n) return;
+  e.innerHTML=Array.from({length:n},()=>'<div class="b"><div class="g"></div><div class="f"></div><div class="a" style="display:none"></div><div class="p" style="display:none"></div></div>').join('');
+  EQ[id].s=Array.from({length:n},()=>({cur:0,pk:0,t:0})); }
+function eqSet(id,fracs,cols,titles,avgs){ const q=EQ[id], now=Date.now(); eqBuild(id,fracs.length);
+  [...el(id).children].forEach((b,i)=>{ const st=q.s[i], f=Math.max(0,Math.min(1,fracs[i]||0)); st.cur=f;
+    if(f>=st.pk){ st.pk=f; st.t=now; }
+    const F=b.children[1]; F.style.height=Math.max(2,Math.round(100*f))+'%'; F.style.backgroundColor=cols[i]; b.title=titles[i];
+    const A=b.children[2]; if(avgs&&avgs[i]!=null){ A.style.display='block'; A.style.bottom=(100*Math.max(0,Math.min(1,avgs[i])))+'%'; } else A.style.display='none'; }); }
+function eqAnimate(){ const now=Date.now();
+  for(const id in EQ){ const q=EQ[id], e=el(id); if(!e) continue;
+    q.s.forEach((st,i)=>{ const b=e.children[i]; if(!b) return; const P=b.children[3];
+      const age=now-st.t; let op=1;
+      if(age>q.hold){ op=Math.max(0,1-(age-q.hold)/q.fade); st.pk=Math.max(st.cur, st.pk-(st.pk-st.cur)*q.sink); }
+      if(st.pk<=st.cur+0.005||op<=0){ P.style.display='none'; return; }
+      P.style.display='block'; P.style.bottom=(100*st.pk)+'%'; P.style.opacity=op.toFixed(2); }); } }
+setInterval(eqAnimate,120);
+function compAvg(rows){ if(!rows||!rows.length||!rows[0].c) return null; const a=[0,0,0,0]; rows.forEach(r=>r.c.forEach((v,i)=>a[i]+=v)); return a.map(v=>v/rows.length); }
 const el=i=>document.getElementById(i);
 const WINS=[[60,'1 h'],[180,'3 h'],[720,'12 h'],[1440,'24 h']];
 function sc(v){return v>=70?'#e04e3a':v>=45?'#e8b923':'#5fd39a'}
@@ -1814,22 +1853,26 @@ async function tick(){
   el('score').textContent=N.score.toFixed(0);
   el('score').style.color=sc(N.score);
   const names=['fanning','agitation','piping','environment'];
-  el('comps').innerHTML=N.comp.map((v,i)=>
-    `<div style="font-size:11px;color:var(--mut)">${names[i]} <b style="color:var(--cream)">${v}</b>
-     <div class="meter"><i style="width:${v}%"></i></div></div>`).join('');
+  const rows=(H&&H.rows)||[], a10=compAvg(rows.slice(-10)), aW=compAvg(rows), wl=(WINS.find(w=>w[0]===MIN)||[0,''])[1];
+  el('comps').innerHTML=N.comp.map((v,i)=>{
+    const t10=a10?`<span class="t" style="left:${a10[i].toFixed(0)}%" title="10-min average ${a10[i].toFixed(0)}"></span>`:'';
+    const tW=aW?`<span class="t w" style="left:${aW[i].toFixed(0)}%" title="${wl} average ${aW[i].toFixed(0)}"></span>`:'';
+    return `<div style="font-size:11px;color:var(--mut)">${names[i]} <b style="color:var(--cream)">${v}</b>${a10?` <span style="opacity:.7">avg ${a10[i].toFixed(0)}</span>`:''}
+     <div class="meter"><i style="width:${v}%"></i>${t10}${tW}</div></div>`;}).join('');
   el('dbfs').textContent=N.dbfs.toFixed(0)+' dBFS'+(N.clip?' · CLIPPING':'');
   el('evstate').innerHTML=N.in_event?'<span class="tag">event in progress</span>':(N.recording?'<span class="tag">recording</span>':'');
   el('baseNote').textContent=N.baseline_ready?'':'Learning this hive\u2019s baseline — scores settle after a minute or so.';
-  const mx=Math.max(...N.band_db,1);
-  el('bars').innerHTML=N.band_db.map((v,i)=>{
-    const d=N.band_dev[i];
-    return `<i style="height:${Math.max(2,Math.round(90*v/mx))}px;background:${d>3?'#e04e3a':d>1?'#e8b923':'#7a6a46'}"
-      title="${N.bands_hz[i]} Hz: ${v.toFixed(1)} dB (${d>=0?'+':''}${d.toFixed(1)} vs baseline)"></i>`;}).join('');
+  // Scale relaxes slowly (about a minute) so bars don't jump every poll and peaks stay comparable.
+  EQ.bars.mx=Math.max(Math.max(...N.band_db,1), EQ.bars.mx*0.99);
+  const b10=rows.slice(-10), bAvg=b10.length&&b10[0].b?N.band_db.map((_,i)=>(b10.reduce((s,r)=>s+r.b[i],0)/b10.length/1.8)/EQ.bars.mx):null;
+  eqSet('bars', N.band_db.map(v=>v/EQ.bars.mx),
+    N.band_dev.map(d=>d>3?'#e04e3a':d>1?'#e8b923':'#7a6a46'),
+    N.band_db.map((v,i)=>`${N.bands_hz[i]} Hz: ${v.toFixed(1)} dB (${N.band_dev[i]>=0?'+':''}${N.band_dev[i].toFixed(1)} vs baseline)`), bAvg);
   el('bandLab').innerHTML=N.bands_hz.map(h=>`<span>${h}</span>`).join('');
-  const sp=N.nose.spec.map(v=>v==null?0:v), smx=Math.max(...sp,1);
-  el('nose').innerHTML=sp.map((v,i)=>
-    `<i style="height:${Math.max(2,Math.round(60*v/smx))}px;background:#e8b923;opacity:.85"
-      title="step ${i} (${N.steps_c[i]}°): ${v.toFixed(0)} kΩ"></i>`).join('');
+  const sp=N.nose.spec.map(v=>v==null?0:v);
+  EQ.nose.mx=Math.max(Math.max(...sp,1), EQ.nose.mx*0.998);
+  eqSet('nose', sp.map(v=>v/EQ.nose.mx), sp.map(()=>'#e8b923'),
+    sp.map((v,i)=>`step ${i} (${N.steps_c[i]}°): ${v.toFixed(0)} kΩ`), null);
   el('noseLab').innerHTML=N.steps_c.map(c=>`<span>${c}°</span>`).join('');
   el('noseMsg').textContent = N.nose.ok
     ? `burst position ${N.nose.burst_pos}${N.nose.burst_pos===1?' (first after a rest — reads high, kept out of the baseline)':''}`
@@ -1843,7 +1886,7 @@ async function tick(){
 async function loadHist(){
   el('win').innerHTML=WINS.map(w=>`<button class="${MIN===w[0]?'on':''}" onclick="MIN=${w[0]};loadHist()">${w[1]}</button>`).join('');
   try{ H=await (await fetch('/api/history?minutes='+MIN)).json(); }catch(e){ return; }
-  drawHist();
+  drawHist(); drawBandHist();
 }
 function drawHist(){
   const cv=el('hist'), c=cv.getContext('2d'), W=cv.width, Ht=cv.height, R=H.rows, n=R.length;
@@ -1934,6 +1977,20 @@ async function loadNose(){
   const n = SPECWIN==='day' ? 1440 : 240;
   try{ NH = await (await fetch(`/api/nose/history?n=${n}&window=${SPECWIN}`)).json(); }catch(e){ return; }
   drawSpec(); patterns();
+}
+function drawBandHist(){
+  const cv=el('bandHist'); if(!cv) return; const c=cv.getContext('2d'), W=cv.width, Ht=cv.height, R=(H&&H.rows)||[], n=R.length;
+  c.fillStyle='#0d0b07'; c.fillRect(0,0,W,Ht);
+  if(!n||!R[0].b){ c.fillStyle='#9a8a6a'; c.font='12px system-ui'; c.fillText('no sound history yet — a row is written every minute',16,Ht/2); return; }
+  const rows=R[0].b.length, rh=(Ht-4)/rows, cw=Math.max(1,W/n), lo=[], hi=[];
+  for(let k=0;k<rows;k++){ const col=R.map(r=>r.b[k]); lo[k]=Math.min(...col); hi[k]=Math.max(...col); }
+  for(let i=0;i<n;i++) for(let k=0;k<rows;k++){
+    const v=R[i].b[k]; c.fillStyle=colour(1-(v-lo[k])/Math.max(1,hi[k]-lo[k]));
+    c.fillRect(i*cw,k*rh,Math.ceil(cw),Math.ceil(rh)); }
+  c.fillStyle='#9a8a6a'; c.font='10px system-ui';
+  const hz=(N&&N.bands_hz)||[];
+  for(let k=0;k<rows;k++) if(k%2===0) c.fillText(hz[k]||'',3,k*rh+rh/2+3);
+  el('bandFrom').textContent=R[0].epoch>1600000000?new Date(R[0].epoch*1000).toLocaleString():'';
 }
 function drawSpec(){
   const cv=el('spec'), c=cv.getContext('2d'), W=cv.width, H=cv.height;

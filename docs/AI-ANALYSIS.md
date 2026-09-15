@@ -1,6 +1,6 @@
 # AI hive analysis (optional)
 
-Since firmware **1.6.x** the Apiary Ears page has an **Analyze hive** button. When you press it,
+Since firmware **1.6** the Apiary Ears page has an **Analyze hive** button. When you press it,
 the board packages the current sensor state into a text prompt, sends it to a language model
 over HTTPS, and shows the reply on the page. Nothing happens until you press the button, and
 nothing happens at all until you have configured a provider.
