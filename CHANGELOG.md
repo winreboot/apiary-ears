@@ -2,6 +2,29 @@
 
 Versions are the `FW_VERSION` in `firmware/apiary_ears/apiary_ears.ino`.
 
+## 1.5.0 — 2026-09-15
+
+**One settled sample per burst — the sawtooth had a deeper cause than position 1.**
+
+Measured on a running node: **10368 kΩ at burst position 3, 13152 kΩ at position 5** — a
+27 % spread between scans in the same burst, with nothing in the air changing. Resistance
+climbs all the way through a burst as the sensing surface recovers, so excluding only
+position 1 (v1.4.1) was not enough: any average over a mixed bag of positions jumps with
+whatever mix that minute happened to hold, which is what produced the spikes in groups.
+
+- **Trends now use exactly one scan per burst**: the last one before the rest, the most
+  equilibrated. Every point is then comparable with every other. That is one sample about
+  every 150 s — ample for something that moves over hours.
+- **The smell baseline follows the same rule.** It was being moved by whichever positions
+  happened to arrive, which is why the deviation figure wandered.
+- **Both charts now default to 24 hours**, which is the view that shows the shape of a day.
+  "Last hour" is still there and still raw: every scan as measured, including the climb
+  through each burst, because that is what raw means.
+- **Clearer wording.** "−27 % below baseline" now reads "27 % less gas than usual", which
+  says which way it moved without needing to reason about the sign.
+
+Flash this one.
+
 ## 1.4.2 — 2026-09-14
 
 **Fixes a compile error in 1.4.1.**

@@ -51,9 +51,13 @@ minute and a half. During the rest the sensing surface recovers, so the **first 
 pause reads several times higher** than the last one before it — a swing far larger than
 most smells produce.
 
-Every scan records its position in the burst. Position 1 is kept in the record but excluded
-from the baseline and from the environment component, so the rest cycle cannot masquerade as
-a change in the air.
+Every scan records its position in the burst, and the effect is larger than just the first
+scan: resistance climbs through the *whole* burst. Measured on one node, 10368 kΩ at
+position 3 against 13152 kΩ at position 5 — 27 % apart with nothing in the air changing.
+
+So trends and the baseline use exactly **one scan per burst**: the last one before the rest,
+the most equilibrated. Every point is then comparable with every other. Raw per-scan views
+still show everything, including the climb, because that is what raw means.
 
 ## Events
 

@@ -70,7 +70,19 @@
  *  keeping at most CLIP_KEEP of them and never filling the partition. The page
  *  shows what is used and what is left. Download anything you want to keep.
  *
- *  v1.4.2
+ *  ONE SAMPLE PER BURST, NOT ONE PER SCAN
+ *  Resistance climbs throughout a burst as the sensing surface recovers - on one
+ *  node, 10368 kOhm at position 3 and 13152 kOhm at position 5, a 27 % spread
+ *  with nothing in the air changing. Excluding only position 1 was not enough:
+ *  any average over a mixed bag of positions jumps around with whatever mix that
+ *  minute happened to contain.
+ *
+ *  So trends use exactly ONE scan per burst - the last one before the rest, the
+ *  most equilibrated - which makes every point comparable with every other. That
+ *  is one sample every ~150 s, ample for something that moves over hours. The
+ *  raw per-scan view still shows everything, because that is what raw means.
+ *
+ *  v1.5.0
  * =============================================================================
  */
 
@@ -87,7 +99,7 @@
 #define WIFI_SSID       "YOUR_WIFI"
 #define WIFI_PASS       "YOUR_PASSWORD"
 #define NODE_NAME       "apiary-ears"
-#define FW_VERSION      "1.4.2"
+#define FW_VERSION      "1.5.0"
 
 #define I2S_SD          4
 #define I2S_WS          5
@@ -171,6 +183,12 @@ uint16_t g_noseHead = 0, g_noseCount = 0;
 struct NoseDayRow { uint32_t epoch; uint16_t kohm[NOSE_STEPS]; };
 NoseDayRow g_noseDay[NOSE_DAY];
 uint16_t   g_dayHead = 0, g_dayCount = 0;
+// The last scan of a burst is the settled one. We only know a scan was the last
+// when the NEXT one arrives with position 1, so keep it until then.
+uint16_t   g_lastOfBurst[NOSE_STEPS] = {0};
+float      g_lastOfBurstMean = NAN;
+uint32_t   g_lastOfBurstEpoch = 0;
+bool       g_haveLastOfBurst = false;
 uint32_t   g_dayAcc[NOSE_STEPS] = {0};
 uint16_t   g_dayAccN = 0;
 uint32_t   g_dayStartMs = 0;
@@ -372,12 +390,20 @@ void onNoseData(const bme68xData data, const bsecOutputs outputs, Bsec2 bsec) {
       g_noseHead = (g_noseHead + 1) % NOSE_RING;
       if (g_noseCount < NOSE_RING) g_noseCount++;
 
-      // Position 1 is the first scan after a rest and reads high for reasons
-      // that have nothing to do with the air - keep it out of the day map.
-      if (g_nosePos >= 2) {
-        for (int k = 0; k < NOSE_STEPS; k++) g_dayAcc[k] += nr.kohm[k];
+      // A burst just ended: the scan we were holding was its last, and therefore
+      // its most settled. That is the one that goes into the trends.
+      if (g_nosePos == 1 && g_haveLastOfBurst) {
+        for (int k = 0; k < NOSE_STEPS; k++) g_dayAcc[k] += g_lastOfBurst[k];
         g_dayAccN++;
-        if (!isnan(mean)) { g_minNoseAcc += mean; g_minNoseN++; }
+        if (!isnan(g_lastOfBurstMean)) { g_minNoseAcc += g_lastOfBurstMean; g_minNoseN++; }
+        g_haveLastOfBurst = false;
+      }
+      // Hold this scan in case it turns out to be the last of the current burst.
+      if (g_nosePos >= 2) {
+        for (int k = 0; k < NOSE_STEPS; k++) g_lastOfBurst[k] = nr.kohm[k];
+        g_lastOfBurstMean = mean;
+        g_lastOfBurstEpoch = nr.epoch;
+        g_haveLastOfBurst = true;
       }
       if (g_dayAccN && millis() - g_dayStartMs >= 60000UL) {
         NoseDayRow& dr = g_noseDay[g_dayHead];
@@ -393,13 +419,15 @@ void onNoseData(const bme68xData data, const bsecOutputs outputs, Bsec2 bsec) {
       // Position 1 is the first scan after the sensor rested: the surface
       // recovered, so it reads high for reasons that have nothing to do with
       // the air. Keep it in the record, keep it out of the baseline.
-      if (!isnan(mean) && g_nosePos >= 2) {
-        g_noseMean = mean;
-        if (isnan(g_noseBase)) g_noseBase = mean;
-        else g_noseBase = 0.995f * g_noseBase + 0.005f * mean;   // ~hours
-        g_noseDev = (g_noseBase > 1.0f) ? (g_noseBase - mean) / g_noseBase : 0.0f;
-      } else if (!isnan(mean)) {
-        g_noseMean = mean;
+      g_noseMean = mean;                       // always show the live reading
+      // ...but only move the baseline on a like-for-like sample: the last scan
+      // of a burst. Mixing positions into the baseline is what made the trend
+      // sawtooth even after position 1 was excluded.
+      if (g_nosePos == 1 && !isnan(g_lastOfBurstMean)) {
+        float m = g_lastOfBurstMean;
+        if (isnan(g_noseBase)) g_noseBase = m;
+        else g_noseBase = 0.99f * g_noseBase + 0.01f * m;
+        g_noseDev = (g_noseBase > 1.0f) ? (g_noseBase - m) / g_noseBase : 0.0f;
       }
       if (g_noseSeq <= 3 || (g_noseSeq % 20) == 0)
         Serial.printf("[nose] scan %lu (%u/10 steps, burst pos %u) mean %.0f kOhm, dev %.2f\n",
@@ -1180,7 +1208,7 @@ a{color:var(--honey)}
 </div>
 
 <script>
-let MIN=180, N=null, H=null;
+let MIN=1440, N=null, H=null;
 const el=i=>document.getElementById(i);
 const WINS=[[60,'1 h'],[180,'3 h'],[720,'12 h'],[1440,'24 h']];
 function sc(v){return v>=70?'#e04e3a':v>=45?'#e8b923':'#5fd39a'}
@@ -1213,7 +1241,9 @@ async function tick(){
     ? `burst position ${N.nose.burst_pos}${N.nose.burst_pos===1?' (first after a rest — reads high, kept out of the baseline)':''}`
       + (N.nose.mean_kohm!=null?` · mean ${N.nose.mean_kohm.toFixed(0)} kΩ`:'')
       + (N.nose.baseline_kohm!=null?` · baseline ${N.nose.baseline_kohm.toFixed(0)} kΩ`:'')
-      + ` · ${(N.nose.dev*100).toFixed(0)}% below baseline`
+      + (N.nose.dev>=0
+          ? ` · ${(N.nose.dev*100).toFixed(0)}% more gas than usual`
+          : ` · ${(-N.nose.dev*100).toFixed(0)}% less gas than usual`)
     : 'No BME688 found — sound still works, the environment component sits at zero.';
 }
 async function loadHist(){
@@ -1297,13 +1327,13 @@ function colour(f){
   const t=(f-a[0])/Math.max(1e-6,b[0]-a[0]), c=a[1].map((v,i)=>Math.round(v+(b[1][i]-v)*t));
   return `rgb(${c[0]},${c[1]},${c[2]})`;
 }
-let NH=null, SPECWIN='recent';
+let NH=null, SPECWIN='day';
 function specWinBtns(){
-  el('specWin').innerHTML = [['recent','last hour'],['day','24 hours']].map(w=>
+  el('specWin').innerHTML = [['day','24 hours'],['recent','last hour']].map(w=>
     `<button class="${SPECWIN===w[0]?'on':''}" onclick="SPECWIN='${w[0]}';loadNose()">${w[1]}</button>`).join('')
     + `<span class="sub" style="margin-left:8px">${SPECWIN==='day'
-        ? 'one column a minute, averaged \u2014 enough to paint the day'
-        : 'one column per scan, full detail'}</span>`;
+        ? 'one settled scan per burst, a column a minute \u2014 the map of the day'
+        : 'every scan as measured, including the climb through each burst'}</span>`;
 }
 async function loadNose(){
   specWinBtns();
