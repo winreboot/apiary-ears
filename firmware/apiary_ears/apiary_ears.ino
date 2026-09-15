@@ -70,7 +70,7 @@
  *  keeping at most CLIP_KEEP of them and never filling the partition. The page
  *  shows what is used and what is left. Download anything you want to keep.
  *
- *  v1.4.1
+ *  v1.4.2
  * =============================================================================
  */
 
@@ -87,7 +87,7 @@
 #define WIFI_SSID       "YOUR_WIFI"
 #define WIFI_PASS       "YOUR_PASSWORD"
 #define NODE_NAME       "apiary-ears"
-#define FW_VERSION      "1.4.1"
+#define FW_VERSION      "1.4.2"
 
 #define I2S_SD          4
 #define I2S_WS          5
@@ -357,6 +357,12 @@ void onNoseData(const bme68xData data, const bsecOutputs outputs, Bsec2 bsec) {
       memcpy(g_specLast, g_spec, sizeof(g_spec));
       g_noseSeq++;
 
+      // Computed once, here, because everything below uses it.
+      float sum = 0; int n = 0;
+      for (int k = 0; k < NOSE_STEPS; k++)
+        if (!isnan(g_spec[k]) && g_spec[k] > 0) { sum += g_spec[k]; n++; }
+      float mean = n ? sum / n : NAN;
+
       NoseRow& nr = g_noseRing[g_noseHead];
       time_t tt = time(nullptr);
       nr.epoch = (tt > 1600000000) ? (uint32_t)tt : (millis() / 1000UL);
@@ -383,10 +389,6 @@ void onNoseData(const bme68xData data, const bsecOutputs outputs, Bsec2 bsec) {
         g_dayAccN = 0;
         g_dayStartMs = millis();
       }
-
-      float sum = 0; int n = 0;
-      for (int k = 0; k < NOSE_STEPS; k++) if (!isnan(g_spec[k]) && g_spec[k] > 0) { sum += g_spec[k]; n++; }
-      float mean = n ? sum / n : NAN;
 
       // Position 1 is the first scan after the sensor rested: the surface
       // recovered, so it reads high for reasons that have nothing to do with
@@ -461,8 +463,9 @@ static void noseBegin() {
 }
 
 // ------------------------------------------------------------------- clips --
-static String specJson(const float* s);  // defined with the web handlers
-static void clipSave();                 // defined below, called from clipService()
+static String specJson(const float* s);          // defined with the web handlers
+static void writeWavHeader(uint8_t*, uint32_t);  // defined below, used by clipSave()
+static void clipSave();                          // called from clipService()
 
 // ---- recordings on flash ---------------------------------------------------
 // Flash is small and a clip is ~320 KB, so the board keeps its own house: make

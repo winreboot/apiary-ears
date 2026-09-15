@@ -2,6 +2,18 @@
 
 Versions are the `FW_VERSION` in `firmware/apiary_ears/apiary_ears.ino`.
 
+## 1.4.2 — 2026-09-14
+
+**Fixes a compile error in 1.4.1.**
+
+`mean` was used one block above where it is declared, so 1.4.1 would not build:
+`error: 'mean' was not declared in this scope`. The mean of the ten heater steps is now
+computed once, at the top of the block, before anything uses it. A forward declaration was
+also added for `writeWavHeader()`, which `clipSave()` calls before its definition.
+
+Both were found by compiling the sketch against stub headers rather than by reading it —
+brace counting cannot catch a scope error, and now does not have to.
+
 ## 1.4.1 — 2026-09-14
 
 **The score/smell/temperature chart was drawing mountains out of nothing.**
