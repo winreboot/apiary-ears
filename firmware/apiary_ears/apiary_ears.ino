@@ -70,7 +70,7 @@
  *  keeping at most CLIP_KEEP of them and never filling the partition. The page
  *  shows what is used and what is left. Download anything you want to keep.
  *
- *  v1.4.0
+ *  v1.4.1
  * =============================================================================
  */
 
@@ -87,7 +87,7 @@
 #define WIFI_SSID       "YOUR_WIFI"
 #define WIFI_PASS       "YOUR_PASSWORD"
 #define NODE_NAME       "apiary-ears"
-#define FW_VERSION      "1.4.0"
+#define FW_VERSION      "1.4.1"
 
 #define I2S_SD          4
 #define I2S_WS          5
@@ -180,13 +180,18 @@ struct MinuteRow {
   uint8_t  band[BAND_COUNT];
   uint8_t  score;
   uint16_t noseMean;                   // kOhm, clipped to 65535
-  int8_t   tempC;
+  int16_t  t10;                          // tenths of a degree C; whole degrees made a
+                                         // gently drifting room look like a square wave
   uint8_t  rh;
 };
 MinuteRow g_min[MINUTE_RING];
 uint16_t  g_minHead = 0, g_minCount = 0;
 uint32_t  g_minAccN = 0;
 float     g_minAcc[BAND_COUNT], g_minScorePeak = 0;
+// Post-rest scans read several times high, so a minute that happens to end on one
+// would spike. Average the settled scans instead of sampling whatever was last.
+double    g_minNoseAcc = 0;
+uint16_t  g_minNoseN = 0;
 uint32_t  g_minStartMs = 0;
 
 struct Event {
@@ -322,13 +327,15 @@ static void minuteRoll() {
   for (int b = 0; b < BAND_COUNT; b++)
     r.band[b] = (uint8_t)fminf(fmaxf((g_minAcc[b] / g_minAccN) * 1.8f, 0.0f), 255.0f);
   r.score = (uint8_t)fminf(g_minScorePeak, 255.0f);
-  r.noseMean = isnan(g_noseMean) ? 0 : (uint16_t)fminf(g_noseMean, 65535.0f);
-  r.tempC = isnan(g_tempC) ? -99 : (int8_t)roundf(g_tempC);
+  r.noseMean = g_minNoseN ? (uint16_t)fminf((float)(g_minNoseAcc / g_minNoseN), 65535.0f)
+                          : (isnan(g_noseMean) ? 0 : (uint16_t)fminf(g_noseMean, 65535.0f));
+  r.t10 = isnan(g_tempC) ? -990 : (int16_t)roundf(g_tempC * 10.0f);
   r.rh = isnan(g_rh) ? 0 : (uint8_t)roundf(g_rh);
   g_minHead = (g_minHead + 1) % MINUTE_RING;
   if (g_minCount < MINUTE_RING) g_minCount++;
   for (int b = 0; b < BAND_COUNT; b++) g_minAcc[b] = 0;
   g_minAccN = 0; g_minScorePeak = 0;
+  g_minNoseAcc = 0; g_minNoseN = 0;
   g_minStartMs = millis();
 }
 
@@ -364,6 +371,7 @@ void onNoseData(const bme68xData data, const bsecOutputs outputs, Bsec2 bsec) {
       if (g_nosePos >= 2) {
         for (int k = 0; k < NOSE_STEPS; k++) g_dayAcc[k] += nr.kohm[k];
         g_dayAccN++;
+        if (!isnan(mean)) { g_minNoseAcc += mean; g_minNoseN++; }
       }
       if (g_dayAccN && millis() - g_dayStartMs >= 60000UL) {
         NoseDayRow& dr = g_noseDay[g_dayHead];
@@ -724,7 +732,7 @@ static void handleHistory() {
     const MinuteRow& r = g_min[(g_minHead + MINUTE_RING - take + i) % MINUTE_RING];
     if (i) j += ',';
     j += "{\"epoch\":" + String(r.epoch) + ",\"score\":" + String(r.score) +
-         ",\"nose\":" + String(r.noseMean) + ",\"t\":" + String(r.tempC) +
+         ",\"nose\":" + String(r.noseMean) + ",\"t\":" + String(r.t10 / 10.0f, 1) +
          ",\"rh\":" + String(r.rh) + ",\"b\":[";
     for (int b = 0; b < BAND_COUNT; b++) { if (b) j += ','; j += String(r.band[b]); }
     j += "]}";
@@ -1007,7 +1015,7 @@ static void handleExport() {
     if (i) o += ",\n";
     o += "    {\"epoch\": " + String(r.epoch) + ", \"score\": " + String(r.score) +
          ", \"nose_mean_kohm\": " + String(r.noseMean) +
-         ", \"temp_c\": " + String(r.tempC) + ", \"rh\": " + String(r.rh) + ", \"band_db\": [";
+         ", \"temp_c\": " + String(r.t10 / 10.0f, 1) + ", \"rh\": " + String(r.rh) + ", \"band_db\": [";
     for (int b = 0; b < BAND_COUNT; b++) { if (b) o += ','; o += String(r.band[b] / 1.8f, 1); }
     o += "]}";
   }
@@ -1218,10 +1226,22 @@ function drawHist(){
   [45,70].forEach(v=>{const y=Ht-10-(Ht-26)*v/100; c.beginPath(); c.moveTo(30,y); c.lineTo(W-6,y); c.stroke();
     c.fillStyle='#9a8a6a'; c.font='10px system-ui'; c.fillText(v,8,y+3);});
   c.setLineDash([]);
+  // Auto-scaling a nearly-flat series turns a rounding wobble into a mountain
+  // range. Give every series a minimum span - a floor in its own units, and at
+  // least a few percent of its own magnitude - so flat things look flat.
+  function span(vals, floorAbs, floorFrac){
+    if(!vals.length) return [0,1];
+    let lo=Math.min(...vals), hi=Math.max(...vals);
+    const mid=(lo+hi)/2;
+    const need=Math.max(floorAbs, Math.abs(mid)*floorFrac);
+    if(hi-lo < need){ lo = mid-need/2; hi = mid+need/2; }
+    const pad=(hi-lo)*0.10;                        // breathing room top and bottom
+    return [lo-pad, hi+pad];
+  }
   const nz=R.map(r=>r.nose>0?r.nose:null).filter(v=>v!=null);
-  const nLo=nz.length?Math.min(...nz):0, nHi=nz.length?Math.max(...nz):1;
+  const [nLo,nHi]=span(nz, 5, 0.08);               // 8 % of the reading, or 5 kOhm
   const tv=R.map(r=>r.t>-99?r.t:null).filter(v=>v!=null);
-  const tLo=tv.length?Math.min(...tv):0, tHi=tv.length?Math.max(...tv):1;
+  const [tLo,tHi]=span(tv, 2.0, 0.02);             // at least a 2 degree window
   const X=i=>30+(W-36)*i/Math.max(1,n-1);
   function line(get,lo,hi,col,w,invert){ c.strokeStyle=col; c.lineWidth=w; c.beginPath(); let on=false;
     R.forEach((r,i)=>{ const v=get(r); if(v==null) return;

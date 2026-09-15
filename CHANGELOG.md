@@ -2,6 +2,25 @@
 
 Versions are the `FW_VERSION` in `firmware/apiary_ears/apiary_ears.ino`.
 
+## 1.4.1 — 2026-09-14
+
+**The score/smell/temperature chart was drawing mountains out of nothing.**
+
+Three causes, all now fixed:
+
+- **Temperature was stored rounded to whole degrees.** A hive drifting across 24↔25 °C
+  became a full-height square wave. Minute rows now keep tenths.
+- **The minute's smell figure was sampled, not averaged.** Whatever `nose_mean` happened to
+  hold when the minute ended went into the row — including the first scan after the sensor
+  rests, which reads several times high for reasons that have nothing to do with the air.
+  Each minute now averages only settled scans.
+- **Auto-scaling magnified whatever was left.** Fitting a nearly-flat series to the full
+  height of the chart turns a rounding wobble into a range of peaks. Every series now has a
+  minimum span — at least 2 °C for temperature, 8 % of the reading for smell — so flat
+  things look flat and real movement still fills the chart.
+
+Flash this one: two of the three are in the firmware.
+
 ## 1.4.0 — 2026-09-14
 
 **A day of smell, a full snapshot with every recording, and the rail monitor removed.**

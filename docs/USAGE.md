@@ -27,7 +27,9 @@ in it is worth walking out to look.
 Position 1 is the first scan after the sensor rested; it reads high for reasons that have
 nothing to do with the air, so it is shown but kept out of the baseline.
 
-**Score, smell and temperature** on one chart. The smell line is inverted so that *more gas
+**Score, smell and temperature** on one chart. Each series is scaled to its own range but
+never below a sensible minimum span, so a hive sitting at a steady temperature draws a flat
+line rather than a mountain range of rounding noise. The smell line is inverted so that *more gas
 is higher*, which makes it read the same direction as the score.
 
 **Events** — what the board caught on its own. Click the note column and say what was
