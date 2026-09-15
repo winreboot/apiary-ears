@@ -37,9 +37,11 @@ whole argument for this build.
 
 The page also shows the **fingerprint over time** as a spectrogram, groups **recurring
 patterns** automatically, lists the **recordings held on the board** with how much flash is
-left, and has a **Node panel** giving uptime, temperature, rail voltage and a per-input diagnosis
+left, and has a **Node panel** giving uptime, temperature and a per-input diagnosis
 with the steps to fix whatever is unhappy — plus a self-check button that re-probes
-everything after you change a cable, and a restart button.
+everything after you change a cable, and a restart button. The fingerprint can be viewed
+over the last hour at full detail or across a whole day, and every recording is saved
+together with a snapshot of what all the sensors said at that moment.
 
 **Every event is scored** so events can be compared between hives and between apiaries:
 0–100, built from fanning (60–180 Hz), agitation (225–315 Hz), piping (360–500 Hz) and an

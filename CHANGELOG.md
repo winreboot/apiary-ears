@@ -2,6 +2,27 @@
 
 Versions are the `FW_VERSION` in `firmware/apiary_ears/apiary_ears.ino`.
 
+## 1.4.0 — 2026-09-14
+
+**A day of smell, a full snapshot with every recording, and the rail monitor removed.**
+
+- **Rail voltage monitoring is gone.** It needed a resistor divider that has to be built,
+  and a panel should not advertise hardware that is not there. Removed from the firmware,
+  the page and the wiring guide.
+- **A day of fingerprints.** The spectrogram gained a window switch: *last hour* at one
+  column per scan, or *24 hours* at one column per minute, averaged. A day of raw scans
+  would not fit in memory and would not say more — smell moves over hours, so a minute is
+  already finer than the signal. Costs about 35 KB of RAM.
+- **Every recording now saves a snapshot of everything**, not just audio. Beside each WAV
+  the board writes a small JSON with the score and its four components, all twelve band
+  levels and their deviations from baseline, the ten-step fingerprint with its burst
+  position, the smell baseline and deviation, temperature, humidity, pressure and the
+  temperature trend. About a kilobyte beside a 320 KB clip.
+- **Retention treats a recording as a set.** The audio and its snapshot are deleted
+  together, because either one alone is much less useful than the pair.
+
+Flash this one.
+
 ## 1.3.1 — 2026-09-14
 
 **Wording fix: "not wired" read as a complaint about the sensor.**

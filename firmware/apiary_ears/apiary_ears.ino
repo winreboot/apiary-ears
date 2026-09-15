@@ -70,17 +70,7 @@
  *  keeping at most CLIP_KEEP of them and never filling the partition. The page
  *  shows what is used and what is left. Download anything you want to keep.
  *
- *  RAIL VOLTAGE (optional, two resistors)
- *  An ESP32 cannot read its own supply directly, so measuring it needs a divider:
- *  two 100k resistors from 3V3 to GND, their midpoint to VMON_33_PIN. For the 5 V
- *  rail use 100k/47k to VMON_5V_PIN. Set the pins below; leave them at -1 and the
- *  page simply says the monitor is not fitted rather than inventing a number.
- *
- *  What matters is not the average but the SAG: the BME688's heater and the
- *  microphone draw in bursts, and a rail that reads 3.30 V but dips to 2.95 V
- *  during a pulse is what resets sensors on a long cable. The page shows both.
- *
- *  v1.3.1
+ *  v1.4.0
  * =============================================================================
  */
 
@@ -97,19 +87,13 @@
 #define WIFI_SSID       "YOUR_WIFI"
 #define WIFI_PASS       "YOUR_PASSWORD"
 #define NODE_NAME       "apiary-ears"
-#define FW_VERSION      "1.3.1"
+#define FW_VERSION      "1.4.0"
 
 #define I2S_SD          4
 #define I2S_WS          5
 #define I2S_SCK         6
 #define SAMPLE_RATE     16000
 #define WIN_SAMPLES     4096       // 256 ms per analysis window
-
-// Rail monitoring. -1 = not fitted; see the header above for the divider.
-#define VMON_33_PIN     -1         // ADC pin on the midpoint of 100k/100k from 3V3
-#define VMON_33_RATIO   2.00f
-#define VMON_5V_PIN     -1         // ADC pin on the midpoint of 100k/47k from 5V
-#define VMON_5V_RATIO   3.13f
 
 #define I2C_SDA         21
 #define I2C_SCL         13
@@ -123,7 +107,8 @@
 #define CLIP_SECONDS    10
 #define CLIP_KEEP       6          // most recordings kept on flash; oldest go first
 #define CLIP_FREE_MIN   65536      // never leave the partition with less than this free
-#define NOSE_RING       300        // fingerprints kept for the spectrogram (~1 h of bursts)
+#define NOSE_RING       240        // raw fingerprints: the last hour or so, full detail
+#define NOSE_DAY        1440       // one averaged fingerprint a minute = a full day (~35 KB)
 #define BURST_GAP_MS    30000UL    // a longer pause means a new burst began
 
 #define EVENT_ON        55         // score at or above this opens an event
@@ -180,6 +165,16 @@ struct NoseRow {                         // one completed fingerprint
 NoseRow  g_noseRing[NOSE_RING];
 uint16_t g_noseHead = 0, g_noseCount = 0;
 
+// A day at one-minute resolution. Raw scans are far too many to keep for 24 h,
+// but a minute's worth averaged paints the map perfectly well - smell moves over
+// hours, so a minute is already finer than the signal.
+struct NoseDayRow { uint32_t epoch; uint16_t kohm[NOSE_STEPS]; };
+NoseDayRow g_noseDay[NOSE_DAY];
+uint16_t   g_dayHead = 0, g_dayCount = 0;
+uint32_t   g_dayAcc[NOSE_STEPS] = {0};
+uint16_t   g_dayAccN = 0;
+uint32_t   g_dayStartMs = 0;
+
 struct MinuteRow {
   uint32_t epoch;
   uint8_t  band[BAND_COUNT];
@@ -208,10 +203,6 @@ uint8_t  g_evCount = 0;
 bool     g_inEvent = false;
 uint8_t  g_onStreak = 0;
 uint32_t g_lastEventEnd = 0;
-
-// rail voltage, sampled often so the minimum catches a sag rather than an average
-float    g_v33 = NAN, g_v33Min = NAN, g_v5 = NAN, g_v5Min = NAN;
-uint32_t g_vMs = 0, g_vWindowMs = 0;
 
 int16_t* g_clipBuf = nullptr;
 size_t   g_clipCap = 0, g_clipLen = 0;
@@ -368,6 +359,23 @@ void onNoseData(const bme68xData data, const bsecOutputs outputs, Bsec2 bsec) {
       g_noseHead = (g_noseHead + 1) % NOSE_RING;
       if (g_noseCount < NOSE_RING) g_noseCount++;
 
+      // Position 1 is the first scan after a rest and reads high for reasons
+      // that have nothing to do with the air - keep it out of the day map.
+      if (g_nosePos >= 2) {
+        for (int k = 0; k < NOSE_STEPS; k++) g_dayAcc[k] += nr.kohm[k];
+        g_dayAccN++;
+      }
+      if (g_dayAccN && millis() - g_dayStartMs >= 60000UL) {
+        NoseDayRow& dr = g_noseDay[g_dayHead];
+        dr.epoch = nr.epoch;
+        for (int k = 0; k < NOSE_STEPS; k++) dr.kohm[k] = (uint16_t)(g_dayAcc[k] / g_dayAccN);
+        g_dayHead = (g_dayHead + 1) % NOSE_DAY;
+        if (g_dayCount < NOSE_DAY) g_dayCount++;
+        for (int k = 0; k < NOSE_STEPS; k++) g_dayAcc[k] = 0;
+        g_dayAccN = 0;
+        g_dayStartMs = millis();
+      }
+
       float sum = 0; int n = 0;
       for (int k = 0; k < NOSE_STEPS; k++) if (!isnan(g_spec[k]) && g_spec[k] > 0) { sum += g_spec[k]; n++; }
       float mean = n ? sum / n : NAN;
@@ -444,31 +452,8 @@ static void noseBegin() {
   Serial.println("[bme688] a new sensor needs 24-48 h of running before its gas readings settle.");
 }
 
-// ------------------------------------------------------------------ volts ---
-// An ESP32 cannot read its own rail, so this needs the divider described in the
-// header. analogReadMilliVolts applies the chip's factory ADC calibration, which
-// is good to a few tens of millivolts - fine for spotting a sagging supply.
-static float readRail(int pin, float ratio) {
-  if (pin < 0) return NAN;
-  uint32_t mv = 0;
-  for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(pin);
-  return (mv / 8.0f) * ratio / 1000.0f;
-}
-
-static void voltsService() {
-  if (millis() - g_vMs < 500) return;
-  g_vMs = millis();
-  float a = readRail(VMON_33_PIN, VMON_33_RATIO);
-  float b = readRail(VMON_5V_PIN, VMON_5V_RATIO);
-  if (!isnan(a)) { g_v33 = a; if (isnan(g_v33Min) || a < g_v33Min) g_v33Min = a; }
-  if (!isnan(b)) { g_v5  = b; if (isnan(g_v5Min)  || b < g_v5Min)  g_v5Min  = b; }
-  if (millis() - g_vWindowMs > 60000UL) {     // a fresh minimum every minute
-    g_vWindowMs = millis();
-    g_v33Min = g_v33; g_v5Min = g_v5;
-  }
-}
-
 // ------------------------------------------------------------------- clips --
+static String specJson(const float* s);  // defined with the web handlers
 static void clipSave();                 // defined below, called from clipService()
 
 // ---- recordings on flash ---------------------------------------------------
@@ -478,15 +463,21 @@ static size_t fsTotal() { return LittleFS.totalBytes(); }
 static size_t fsUsed()  { return LittleFS.usedBytes(); }
 static size_t fsFree()  { size_t t = fsTotal(), u = fsUsed(); return t > u ? t - u : 0; }
 
-static int clipCount() {
+static int clipCount() {                     // counts recordings, not files
   int n = 0;
   File d = LittleFS.open("/clips");
   if (!d || !d.isDirectory()) return 0;
-  for (File f = d.openNextFile(); f; f = d.openNextFile()) if (!f.isDirectory()) n++;
+  for (File f = d.openNextFile(); f; f = d.openNextFile()) {
+    if (f.isDirectory()) continue;
+    String nm = f.name();
+    if (nm.endsWith(".wav")) n++;
+  }
   return n;
 }
 
-// The oldest clip is the one whose name sorts first: names begin with the epoch.
+// The oldest recording is the one whose name sorts first: names begin with the
+// epoch. A recording is a SET - the audio and the snapshot of every sensor at
+// that moment - so they are deleted together or the survivor is meaningless.
 static bool clipDeleteOldest() {
   String oldest;
   File d = LittleFS.open("/clips");
@@ -495,12 +486,14 @@ static bool clipDeleteOldest() {
     if (f.isDirectory()) continue;
     String n = f.name();
     if (n.startsWith("/")) n = n.substring(1);
+    if (!n.endsWith(".wav")) continue;              // the audio leads; its json follows
     if (!oldest.length() || n < oldest) oldest = n;
   }
   if (!oldest.length()) return false;
-  String path = "/clips/" + oldest;
-  Serial.printf("[clip] making room: deleting %s\n", path.c_str());
-  return LittleFS.remove(path);
+  String stem = oldest.substring(0, oldest.length() - 4);
+  Serial.printf("[clip] making room: deleting %s (audio and snapshot)\n", stem.c_str());
+  LittleFS.remove("/clips/" + stem + ".json");
+  return LittleFS.remove("/clips/" + oldest);
 }
 
 static void clipMakeRoom(size_t needed) {
@@ -567,7 +560,51 @@ static void clipSave() {
     f.write((const uint8_t*)(g_clipBuf + off), n * 2);
   }
   f.close();
-  Serial.printf("[clip] saved %s (%u KB) - %d on flash, %u KB free\n",
+
+  // Everything the board knew at that moment, beside the audio. Small - about a
+  // kilobyte - so it costs nothing next to a 320 KB clip, and without it the
+  // recording is just a noise with a date on it.
+  char jpath[80];
+  snprintf(jpath, sizeof(jpath), "/clips/%lu-%s.json", (unsigned long)g_clipEpoch, safe);
+  File jf = LittleFS.open(jpath, "w");
+  if (jf) {
+    String o = "{\n  \"schema_version\": 1,\n  \"kind\": \"event_snapshot\",\n";
+    o += "  \"node\": \"" NODE_NAME "\",\n  \"firmware\": \"apiary_ears " FW_VERSION "\",\n";
+    o += "  \"epoch\": " + String(g_clipEpoch) + ",\n";
+    o += "  \"label\": \"" + String(g_clipLabel) + "\",\n";
+    o += "  \"audio_file\": \"" + String(path).substring(7) + "\",\n";
+    o += "  \"audio\": {\"sample_rate_hz\": " + String(SAMPLE_RATE) +
+         ", \"channels\": 1, \"bit_depth\": 16, \"duration_s\": " +
+         String(g_clipLen / (float)SAMPLE_RATE, 1) + "},\n";
+    o += "  \"score\": " + String(g_score, 1) + ",\n";
+    o += "  \"components\": {\"fanning\": " + String(g_scComp[0], 0) +
+         ", \"agitation\": " + String(g_scComp[1], 0) +
+         ", \"piping\": " + String(g_scComp[2], 0) +
+         ", \"environment\": " + String(g_scComp[3], 0) + "},\n";
+    o += "  \"bands_hz\": [";
+    for (int b = 0; b < BAND_COUNT; b++) { if (b) o += ','; o += String(BAND_HZ[b], 0); }
+    o += "],\n  \"band_db\": [";
+    for (int b = 0; b < BAND_COUNT; b++) { if (b) o += ','; o += String(g_band[b], 1); }
+    o += "],\n  \"band_dev_db\": [";
+    for (int b = 0; b < BAND_COUNT; b++) { if (b) o += ','; o += String(g_dev[b], 1); }
+    o += "],\n  \"dbfs\": " + String(g_dbfs, 1) + ",\n";
+    o += "  \"nose_steps_c\": [";
+    for (int k = 0; k < NOSE_STEPS; k++) { if (k) o += ','; o += String(HEATER_C[k]); }
+    o += "],\n  \"nose_spec_kohm\": " + specJson(g_specLast) + ",\n";
+    o += "  \"nose_burst_pos\": " + String(g_nosePos) + ",\n";
+    o += "  \"nose_mean_kohm\": " + (isnan(g_noseMean) ? String("null") : String(g_noseMean, 1)) + ",\n";
+    o += "  \"nose_baseline_kohm\": " + (isnan(g_noseBase) ? String("null") : String(g_noseBase, 1)) + ",\n";
+    o += "  \"nose_dev\": " + String(g_noseDev, 3) + ",\n";
+    o += "  \"temp_c\": " + (isnan(g_tempC) ? String("null") : String(g_tempC, 1)) + ",\n";
+    o += "  \"rh_pct\": " + (isnan(g_rh) ? String("null") : String(g_rh, 1)) + ",\n";
+    o += "  \"hpa\": " + (isnan(g_hpa) ? String("null") : String(g_hpa, 1)) + ",\n";
+    o += "  \"temp_rate_h\": " + String(g_tempRate, 2) + ",\n";
+    o += "  \"note\": \"\"\n}\n";
+    jf.print(o);
+    jf.close();
+  }
+
+  Serial.printf("[clip] saved %s + snapshot (%u KB) - %d recording(s) on flash, %u KB free\n",
                 path, (unsigned)((bytes + 44) / 1024), clipCount(), (unsigned)(fsFree() / 1024));
 }
 
@@ -774,21 +811,30 @@ static void handleListen() {
 static void handleNoseHistory() {
   uint16_t want = server.hasArg("n") ? (uint16_t)server.arg("n").toInt() : 200;
   if (want < 10) want = 10;
-  if (want > NOSE_RING) want = NOSE_RING;
-  uint16_t take = (uint16_t)min<uint16_t>(want, g_noseCount);
+  if (want > NOSE_DAY) want = NOSE_DAY;
+  bool day = server.arg("window") == "day";
+  uint16_t take = day ? (uint16_t)min<uint16_t>(want, g_dayCount)
+                      : (uint16_t)min<uint16_t>(want, g_noseCount);
   bool settled = server.arg("settled") != "0";        // hide post-rest scans by default
 
-  String j = "{\"ok\":true,\"steps_c\":[";
+  String j = "{\"ok\":true,\"window\":\"" + String(day ? "day" : "recent") + "\",\"steps_c\":[";
   for (int k = 0; k < NOSE_STEPS; k++) { if (k) j += ','; j += String(HEATER_C[k]); }
   j += "],\"scans\":[";
   bool first = true;
   for (uint16_t i = 0; i < take; i++) {
-    const NoseRow& r = g_noseRing[(g_noseHead + NOSE_RING - take + i) % NOSE_RING];
-    if (settled && r.pos == 1) continue;
+    uint32_t ep; const uint16_t* g; uint8_t pos;
+    if (day) {
+      const NoseDayRow& r = g_noseDay[(g_dayHead + NOSE_DAY - take + i) % NOSE_DAY];
+      ep = r.epoch; g = r.kohm; pos = 2;             // already averaged, all settled
+    } else {
+      const NoseRow& r = g_noseRing[(g_noseHead + NOSE_RING - take + i) % NOSE_RING];
+      if (settled && r.pos == 1) continue;
+      ep = r.epoch; g = r.kohm; pos = r.pos;
+    }
     if (!first) j += ',';
     first = false;
-    j += "{\"epoch\":" + String(r.epoch) + ",\"pos\":" + String(r.pos) + ",\"g\":[";
-    for (int k = 0; k < NOSE_STEPS; k++) { if (k) j += ','; j += String(r.kohm[k]); }
+    j += "{\"epoch\":" + String(ep) + ",\"pos\":" + String(pos) + ",\"g\":[";
+    for (int k = 0; k < NOSE_STEPS; k++) { if (k) j += ','; j += String(g[k]); }
     j += "]}";
   }
   j += "]}";
@@ -808,14 +854,19 @@ static void handleClipList() {
       if (f.isDirectory()) continue;
       String n = f.name();
       if (n.startsWith("/")) n = n.substring(1);
+      if (!n.endsWith(".wav")) continue;              // the json is listed with its audio
       int dash = n.indexOf('-');
       String ep = dash > 0 ? n.substring(0, dash) : "0";
       String lb = dash > 0 ? n.substring(dash + 1) : n;
       lb.replace(".wav", "");
       if (!first) j += ',';
       first = false;
+      String stem = n.substring(0, n.length() - 4);
+      bool hasSnap = LittleFS.exists("/clips/" + stem + ".json");
       j += "{\"name\":\"" + n + "\",\"epoch\":" + ep +
-           ",\"label\":\"" + lb + "\",\"bytes\":" + String((unsigned long)f.size()) + "}";
+           ",\"label\":\"" + lb + "\",\"bytes\":" + String((unsigned long)f.size()) +
+           ",\"snapshot\":" + String(hasSnap ? "true" : "false") +
+           ",\"snapshot_name\":\"" + stem + ".json\"}";
     }
   }
   j += "]}";
@@ -830,8 +881,9 @@ static void handleClipFile() {
   String path = "/clips/" + n;
   File f = LittleFS.open(path, "r");
   if (!f) { server.send(404, "text/plain", "no such recording\n"); return; }
-  server.sendHeader("Content-Disposition", "attachment; filename=\"" + n + "\"");
-  server.streamFile(f, "audio/wav");
+  bool isJson = n.endsWith(".json");
+  if (!isJson) server.sendHeader("Content-Disposition", "attachment; filename=\"" + n + "\"");
+  server.streamFile(f, isJson ? "application/json" : "audio/wav");
   f.close();
 }
 
@@ -841,6 +893,7 @@ static void handleClipDelete() {
     sendJson("{\"ok\":false,\"error\":\"bad name\"}"); return;
   }
   bool ok = LittleFS.remove("/clips/" + n);
+  if (n.endsWith(".wav")) LittleFS.remove("/clips/" + n.substring(0, n.length() - 4) + ".json");
   sendJson(String("{\"ok\":") + (ok ? "true" : "false") + "}");
 }
 
@@ -857,13 +910,6 @@ static void handleNode() {
        ",\"psram\":" + String((unsigned long)ESP.getFreePsram()) +
        ",\"rssi\":" + String(WiFi.RSSI()) +
        ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
-  j += ",\"volts\":{";
-  j += "\"v33\":{\"fitted\":" + String(VMON_33_PIN >= 0 ? "true" : "false") +
-       ",\"now\":" + (isnan(g_v33) ? String("null") : String(g_v33, 3)) +
-       ",\"min\":" + (isnan(g_v33Min) ? String("null") : String(g_v33Min, 3)) + "},";
-  j += "\"v5\":{\"fitted\":" + String(VMON_5V_PIN >= 0 ? "true" : "false") +
-       ",\"now\":" + (isnan(g_v5) ? String("null") : String(g_v5, 3)) +
-       ",\"min\":" + (isnan(g_v5Min) ? String("null") : String(g_v5Min, 3)) + "}}";
   j += ",\"storage\":{\"total\":" + String((unsigned long)fsTotal()) +
        ",\"used\":" + String((unsigned long)fsUsed()) +
        ",\"free\":" + String((unsigned long)fsFree()) +
@@ -927,8 +973,6 @@ static void handleSelfCheck() {
   // give the microphone a moment to prove itself rather than reporting a stale level
   static float mono[WIN_SAMPLES];
   readWindow(mono, WIN_SAMPLES);
-  g_v33Min = g_v33; g_v5Min = g_v5;              // reset the sag window too
-
   sendJson(String("{\"ok\":true,\"was\":\"") + before + "\",\"now\":\"" +
            (g_noseOk ? "ok" : "missing") + "\",\"mic_dbfs\":" + String(g_dbfs, 1) + "}");
 }
@@ -1055,6 +1099,7 @@ a{color:var(--honey)}
 
 <div class="card">
   <h2>Fingerprint over time</h2>
+  <div id="specWin" style="margin-bottom:8px"></div>
   <canvas id="spec" width="840" height="190"></canvas>
   <div class="lab"><span id="specFrom"></span><span>rows = heater steps · brighter = more gas at that temperature</span><span>now</span></div>
   <div class="note">Each column is one scan. A smell arriving shows as a vertical band; which rows light up is the shape that tells one smell from another.</div>
@@ -1087,13 +1132,15 @@ a{color:var(--honey)}
   <div class="meter" style="height:12px"><i id="stBar" style="width:0%"></i></div>
   <div class="lab"><span id="stText">reading storage…</span><span id="stKeep"></span></div>
   <div id="clips" style="margin-top:8px"></div>
-  <div class="note">Flash is small: about five ten-second clips fit. The board deletes the oldest before recording a new one, so it never runs out — download anything worth keeping.</div>
+  <div class="note">Every recording is a pair: the audio, and a snapshot of what every sensor
+  said at that moment — score and its parts, all twelve bands, the ten-step fingerprint,
+  temperature, humidity and pressure. Flash is small, about five pairs, so the board deletes
+  the oldest set before recording a new one. Download anything worth keeping.</div>
 </div>
 
 <div class="card">
   <h2>Node</h2>
   <div id="nodeSummary" class="sub">…</div>
-  <div id="rails" style="margin:6px 0"></div>
   <button onclick="toggleNode()" id="nodeBtn">Show diagnostics</button>
   <button onclick="selfCheck()" id="scBtn" title="Look again — use this after plugging a cable back in">&#8635; Self-check</button>
   <button onclick="restartNode()" style="border-color:rgba(224,78,58,.5);color:#e04e3a">Restart node</button>
@@ -1227,9 +1274,18 @@ function colour(f){
   const t=(f-a[0])/Math.max(1e-6,b[0]-a[0]), c=a[1].map((v,i)=>Math.round(v+(b[1][i]-v)*t));
   return `rgb(${c[0]},${c[1]},${c[2]})`;
 }
-let NH=null;
+let NH=null, SPECWIN='recent';
+function specWinBtns(){
+  el('specWin').innerHTML = [['recent','last hour'],['day','24 hours']].map(w=>
+    `<button class="${SPECWIN===w[0]?'on':''}" onclick="SPECWIN='${w[0]}';loadNose()">${w[1]}</button>`).join('')
+    + `<span class="sub" style="margin-left:8px">${SPECWIN==='day'
+        ? 'one column a minute, averaged \u2014 enough to paint the day'
+        : 'one column per scan, full detail'}</span>`;
+}
 async function loadNose(){
-  try{ NH = await (await fetch('/api/nose/history?n=240')).json(); }catch(e){ return; }
+  specWinBtns();
+  const n = SPECWIN==='day' ? 1440 : 240;
+  try{ NH = await (await fetch(`/api/nose/history?n=${n}&window=${SPECWIN}`)).json(); }catch(e){ return; }
   drawSpec(); patterns();
 }
 function drawSpec(){
@@ -1286,9 +1342,10 @@ async function loadClips(){
   const rows=(C.clips||[]).slice().sort((a,b)=>b.epoch-a.epoch);
   el('clips').innerHTML = rows.length ? '<table>'+rows.map(c=>
     `<tr><td>${c.epoch>1600000000?new Date(c.epoch*1000).toLocaleString():c.epoch+' s'}</td>
-     <td>${c.label}</td><td>${kb(c.bytes)}</td>
-     <td style="text-align:right"><a href="/api/clip?name=${encodeURIComponent(c.name)}">download</a>
-     <span class="x" title="delete" onclick="delClip('${c.name}')">\u2715</span></td></tr>`).join('')+'</table>'
+     <td>${c.label}${c.snapshot?'':' <span class="sub">(audio only)</span>'}</td><td>${kb(c.bytes)}</td>
+     <td style="text-align:right"><a href="/api/clip?name=${encodeURIComponent(c.name)}">audio</a>
+     ${c.snapshot?` \u00b7 <a href="/api/clip?name=${encodeURIComponent(c.snapshot_name)}">snapshot</a>`:''}
+     <span class="x" title="delete both" onclick="delClip('${c.name}')">\u2715</span></td></tr>`).join('')+'</table>'
     : '<div class="note">Nothing recorded yet.</div>';
 }
 async function delClip(n){
@@ -1306,31 +1363,6 @@ function toggleNode(){
 function dur(s){
   const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60);
   return (d?d+'d ':'')+(h||d?h+'h ':'')+m+'m';
-}
-// Green while the rail is where it should be, honey when it is drooping, red
-// when it is somewhere that resets sensors. The MINIMUM is the interesting
-// number: heaters and radios draw in bursts.
-function railClass(v, nominal){
-  if(v==null) return ['', ''];
-  if(nominal===3.3){
-    if(v>=3.20 && v<=3.40) return ['#5fd39a','good'];
-    if(v>=3.05 && v<=3.50) return ['#e8b923','drooping'];
-    return ['#e04e3a', v<3.05?'too low':'too high'];
-  }
-  if(v>=4.75 && v<=5.25) return ['#5fd39a','good'];
-  if(v>=4.50 && v<=5.50) return ['#e8b923','drooping'];
-  return ['#e04e3a', v<4.5?'too low':'too high'];
-}
-function railChip(label, r, nominal){
-  if(!r || !r.fitted)
-    return `<span class="sub" style="margin-right:14px">${label} rail monitor: not fitted <i>(optional)</i></span>`;
-  const [c, word] = railClass(r.now, nominal);
-  const [cm]      = railClass(r.min, nominal);
-  const sag = (r.min!=null && r.now!=null && (r.now - r.min) >= 0.05)
-    ? ` <span style="color:${cm}">(dips to ${r.min.toFixed(2)})</span>` : '';
-  return `<span style="margin-right:14px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;
-            background:${c};margin-right:5px"></span>${label} <b>${r.now==null?'—':r.now.toFixed(2)} V</b>
-            <span class="sub">${word}</span>${sag}</span>`;
 }
 async function selfCheck(){
   const b=el('scBtn'); b.textContent='\u21bb Checking\u2026'; b.disabled=true;
@@ -1364,12 +1396,6 @@ async function loadNode(){
   let N2; try{ N2=await (await fetch('/api/node')).json(); }catch(e){ return; }
   el('nodeSummary').textContent =
     `up ${dur(N2.uptime_s)} \u00b7 ${N2.die_c.toFixed(0)} \u00b0C die \u00b7 ${kb(N2.heap)} heap \u00b7 ${N2.rssi} dBm \u00b7 ${N2.ip}`;
-  const V=N2.volts||{};
-  el('rails').innerHTML = railChip('3.3 V', V.v33, 3.3) + railChip('5 V', V.v5, 5.0)
-    + ((V.v33 && V.v33.fitted) ? '' :
-       '<div class="sub" style="margin-top:4px">This is about measuring the supply, not powering the sensors \u2014 '
-       + 'an ESP32 cannot read its own rail. Two resistors and one <code>#define</code> add it: see docs/WIRING.md. '
-       + 'Worth fitting on a long cable, where a rail that reads fine but dips during a heater pulse is what resets a sensor.</div>');
   const st=N2.storage||{};
   el('nodeDetail').innerHTML =
     (N2.inputs||[]).map(i=>
@@ -1426,10 +1452,6 @@ void setup() {
                   (unsigned)(fsTotal() / 1024), (unsigned)(fsFree() / 1024), clipCount(), CLIP_KEEP);
   }
 
-  if (VMON_33_PIN >= 0) analogSetPinAttenuation(VMON_33_PIN, ADC_11db);
-  if (VMON_5V_PIN >= 0) analogSetPinAttenuation(VMON_5V_PIN, ADC_11db);
-  g_vWindowMs = millis();
-
   audioBegin();
   noseBegin();
 
@@ -1441,6 +1463,7 @@ void setup() {
     Serial.println("[clip] no PSRAM - clips limited to 2 s");
   }
   g_minStartMs = millis();
+  g_dayStartMs = millis();
 
   server.on("/", handleRoot);
   server.on("/api/now", handleNow);
@@ -1466,7 +1489,6 @@ void setup() {
 void loop() {
   server.handleClient();
   if (g_noseOk) nose.run();          // BSEC decides when to talk to the sensor
-  voltsService();
   if (g_clipRecording) { clipService(); return; }   // recording takes priority
   scoreWindow();
   eventService();
