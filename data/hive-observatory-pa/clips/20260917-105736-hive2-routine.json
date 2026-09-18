@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "kind": "acoustic_clip",
+  "apiary_id": "hive-observatory-pa",
+  "hive_id": "hive2",
+  "recorded_utc": "",
+  "file": "20260917-105736-hive2-routine.wav",
+  "audio": {
+    "sample_rate_hz": 16000,
+    "channels": 1,
+    "bit_depth": 16,
+    "duration_s": 20.0,
+    "bytes": 640044
+  },
+  "microphone": "INMP441 I2S, inside the hive body",
+  "site": {
+    "region": "Pocono Plateau, Pennsylvania, USA",
+    "climate": "",
+    "hive_type": "Langstroth 10-frame"
+  },
+  "event": {
+    "type": "routine",
+    "risk": 70.0,
+    "risk_scale": "0-100, this apiary's own swarm-risk model at capture time; comparable only as a trend within one apiary unless the model is stated",
+    "confidence": "certain",
+    "notes": "",
+    "capture_trigger": "swarm"
+  },
+  "conditions_at_capture": {
+    "temperature": 71.4,
+    "humidity": 95.0,
+    "co2": 5831.0,
+    "weight": 29.4,
+    "audio_level": 55.8,
+    "swarm_risk": 69.8
+  },
+  "note_on_comparability": "The WAV is the portable part: any band scheme or model can be recomputed from it. The figures under conditions_at_capture come from this apiary's own sensors and calibration, and should be treated as context rather than as measurements comparable across sites."
+}
